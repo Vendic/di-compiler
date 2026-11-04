@@ -1537,7 +1537,9 @@ class Bar {
                 "{modifiers}"
             );
         }
+    }
 
+    #[test]
     fn test_class_keywords_in_any_case() {
         let php = "<?php\nNAMESPACE Foo;\nUSE Other\\Dep AS Alias;\nCLASS Bar EXTENDS Base IMPLEMENTS Face\n{\n    Public Function __CONSTRUCT(Alias $dep) {}\n    PUBLIC STATIC FUNCTION run() {}\n    Private Function hidden() {}\n}";
         let info = extract_str(php).unwrap();
