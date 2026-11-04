@@ -228,7 +228,7 @@ impl<'a> Scanner<'a> {
                 continue;
             }
             let word = self.read_word();
-            match word {
+            match word.to_ascii_lowercase().as_slice() {
                 b"namespace" => {
                     namespace = self.read_namespace_decl()?;
                     self.namespace = namespace.clone();
@@ -298,7 +298,11 @@ impl<'a> Scanner<'a> {
                     break;
                 }
                 b"enum" => {
-                    return Err(LexError::Unsupported("enum".into()));
+                    // `enum` is a keyword only in front of a name. `Enum` can also be a type.
+                    self.skip_noise();
+                    if is_word_start(self.peek()) {
+                        return Err(LexError::Unsupported("enum".into()));
+                    }
                 }
                 _ => {}
             }
@@ -386,7 +390,7 @@ impl<'a> Scanner<'a> {
         let saved = self.pos;
         if is_word_start(self.peek()) {
             let w = self.read_word();
-            if w == b"function" || w == b"const" {
+            if w.eq_ignore_ascii_case(b"function") || w.eq_ignore_ascii_case(b"const") {
                 self.skip_to_semicolon();
                 return;
             }
@@ -479,7 +483,7 @@ impl<'a> Scanner<'a> {
             return None;
         }
         let w = self.read_word();
-        if w == b"as" {
+        if w.eq_ignore_ascii_case(b"as") {
             self.skip_noise();
             if is_word_start(self.peek()) {
                 let alias = self.read_word();
@@ -551,7 +555,7 @@ impl<'a> Scanner<'a> {
                 continue;
             }
             let word = self.read_word();
-            match word {
+            match word.to_ascii_lowercase().as_slice() {
                 b"extends" => {
                     let fqn = self.read_fqn()?;
                     if extends.is_none() {
@@ -709,7 +713,7 @@ impl<'a> Scanner<'a> {
 
             let first_word = self.read_word();
             let is_modifier = matches!(
-                first_word,
+                first_word.to_ascii_lowercase().as_slice(),
                 b"abstract"
                     | b"final"
                     | b"public"
@@ -726,7 +730,7 @@ impl<'a> Scanner<'a> {
 
             let mut current = first_word;
             loop {
-                match current {
+                match current.to_ascii_lowercase().as_slice() {
                     b"abstract" => is_abstract_method = true,
                     b"final" => is_final_method = true,
                     b"public" => is_public = true,
@@ -775,7 +779,7 @@ impl<'a> Scanner<'a> {
             }
             self.advance(1);
 
-            if method_name == "__construct" {
+            if method_name.eq_ignore_ascii_case("__construct") {
                 let params = self.parse_param_list()?;
                 constructor = Some(Constructor { params });
                 self.skip_noise();
@@ -1473,6 +1477,50 @@ class Bar {
         assert_eq!(ctor.params.len(), 2);
         assert!(ctor.params[0].is_promoted);
         assert!(ctor.params[1].is_promoted);
+    }
+
+    #[test]
+    fn test_class_keywords_in_any_case() {
+        let php = "<?php\nNAMESPACE Foo;\nUSE Other\\Dep AS Alias;\nCLASS Bar EXTENDS Base IMPLEMENTS Face\n{\n    Public Function __CONSTRUCT(Alias $dep) {}\n    PUBLIC STATIC FUNCTION run() {}\n    Private Function hidden() {}\n}";
+        let info = extract_str(php).unwrap();
+        assert_eq!(info.fqcn, "Foo\\Bar");
+        assert!(matches!(info.kind, ClassKind::Class));
+        assert_eq!(info.extends.as_deref(), Some("Foo\\Base"));
+        assert_eq!(info.implements, vec!["Foo\\Face"]);
+        let ctor = info.constructor.unwrap();
+        assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Other\\Dep"));
+        assert_eq!(info.public_methods.len(), 1);
+        assert_eq!(info.public_methods[0].name, "run");
+        assert!(info.public_methods[0].is_static);
+    }
+
+    #[test]
+    fn test_class_like_declarations_in_any_case() {
+        let info = extract_str("<?php\nnamespace Foo;\nInterface Bar {}").unwrap();
+        assert!(matches!(info.kind, ClassKind::Interface));
+
+        let info = extract_str("<?php\nnamespace Foo;\nTrait Bar {}").unwrap();
+        assert!(matches!(info.kind, ClassKind::Trait));
+
+        let info = extract_str("<?php\nnamespace Foo;\nAbstract Class Bar {}").unwrap();
+        assert!(info.is_abstract);
+
+        let info = extract_str("<?php\nnamespace Foo;\nFINAL Class Bar {}").unwrap();
+        assert!(info.is_final);
+
+        let info = extract_str("<?php\nnamespace Foo;\nReadonly Class Bar {}").unwrap();
+        assert_eq!(info.fqcn, "Foo\\Bar");
+
+        assert!(matches!(
+            extract_str("<?php\nnamespace Foo;\nEnum Bar {}"),
+            Err(LexError::Unsupported(reason)) if reason == "enum"
+        ));
+    }
+
+    #[test]
+    fn test_enum_as_a_type_name_does_not_hide_the_class() {
+        let php = "<?php\nnamespace Foo;\nfunction make(): Enum {}\nclass Bar {}";
+        assert_eq!(extract_str(php).unwrap().fqcn, "Foo\\Bar");
     }
 
     #[test]
