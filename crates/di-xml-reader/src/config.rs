@@ -341,10 +341,21 @@ fn collect_di_xml_files(
         roots
     }
 
-    // Priority 0: app/etc/di.xml (primary scope)
+    // Priority 0: app/etc/di.xml and app/etc/*/di.xml (primary scope)
     let app_etc_di = magento_root.join("app/etc/di.xml");
     if app_etc_di.exists() {
         paths.push((0, 0, app_etc_di));
+    }
+    // Then app/etc/*/di.xml, like the glob `{di.xml,*/di.xml}` in Magento's FileResolver.
+    // The glob's `*` does not match hidden folders.
+    if let Ok(entries) = std::fs::read_dir(magento_root.join("app/etc")) {
+        for entry in entries.flatten() {
+            let hidden = entry.file_name().to_string_lossy().starts_with('.');
+            let di_xml = entry.path().join("di.xml");
+            if !hidden && di_xml.exists() {
+                paths.push((0, 1, di_xml));
+            }
+        }
     }
 
     // Priority 1: vendor/magento/*
@@ -603,5 +614,33 @@ mod tests {
         assert_eq!(vendor_paths.len(), 2);
         assert_eq!(vendor_paths[0], &module_b.join("etc/di.xml"));
         assert_eq!(vendor_paths[1], &module_a.join("etc/di.xml"));
+    }
+
+    #[test]
+    fn test_find_di_xml_files_reads_app_etc_subfolders_after_app_etc_di_xml() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let empty = r#"<?xml version="1.0"?><config></config>"#;
+        for dir in ["app/etc", "app/etc/aaa", "app/etc/zzz", "app/etc/.hidden"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("di.xml"), empty).unwrap();
+        }
+        // Two levels deep is not matched by Magento's `*/di.xml`.
+        fs::create_dir_all(root.join("app/etc/aaa/deep")).unwrap();
+        fs::write(root.join("app/etc/aaa/deep/di.xml"), empty).unwrap();
+        // A folder without a di.xml is ignored.
+        fs::create_dir_all(root.join("app/etc/nothing")).unwrap();
+
+        let paths = super::find_di_xml_files(root, &FxHashMap::default());
+
+        // Same order as the glob `{di.xml,*/di.xml}` in FileResolver.
+        assert_eq!(
+            paths,
+            vec![
+                root.join("app/etc/di.xml"),
+                root.join("app/etc/aaa/di.xml"),
+                root.join("app/etc/zzz/di.xml"),
+            ]
+        );
     }
 }

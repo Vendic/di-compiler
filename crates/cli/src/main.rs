@@ -555,18 +555,7 @@ fn main() {
     //   Phase 1: deep-merge all module di.xml files together (items accumulate by name)
     //   Phase 2: apply merged module result on app/etc/di.xml with shallow arg replacement
     //            (PHP uses array_replace at argument-name level, not item-level deep merge)
-    let app_etc_di_path = magento_root.join("app/etc/di.xml");
-    let (primary_configs, module_configs): (Vec<_>, Vec<_>) = global_di_path_configs
-        .iter()
-        .partition(|(p, _)| *p == app_etc_di_path);
-    let primary_base = merge_configs(
-        primary_configs
-            .into_iter()
-            .map(|(_, c)| c.clone())
-            .collect(),
-    );
-    let module_merged = merge_configs(module_configs.into_iter().map(|(_, c)| c.clone()).collect());
-    let di_config = apply_module_config_on_primary(primary_base, module_merged);
+    let di_config = merge_global_di_configs(&global_di_path_configs, &magento_root);
 
     // Flat Vec<DiConfig> (without path) for detection purposes (plugins/types, not arg values).
     let global_di_configs: Vec<DiConfig> =
@@ -5502,6 +5491,21 @@ fn module_root_from_di_xml(di_xml: &Path) -> Option<&Path> {
     }
 }
 
+/// Merge the primary files and the module files in two phases, see Phase 3a.
+fn merge_global_di_configs(configs: &[(PathBuf, DiConfig)], magento_root: &Path) -> DiConfig {
+    let app_etc = magento_root.join("app/etc");
+    let (primary_configs, module_configs): (Vec<_>, Vec<_>) =
+        configs.iter().partition(|(p, _)| p.starts_with(&app_etc));
+    let primary_base = merge_configs(
+        primary_configs
+            .into_iter()
+            .map(|(_, c)| c.clone())
+            .collect(),
+    );
+    let module_merged = merge_configs(module_configs.into_iter().map(|(_, c)| c.clone()).collect());
+    apply_module_config_on_primary(primary_base, module_merged)
+}
+
 /// Vendor packages that must always be excluded from DI config regardless of
 /// whether they have a `registration.php`. These are test-only or dev-only
 /// frameworks that ship a di.xml but must never contribute to production DI.
@@ -6153,6 +6157,50 @@ mod tests {
         );
 
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn primary_subfolder_di_xml_is_merged_as_primary_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, item: &str, arg: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!(
+                    r#"<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+                    <type name="Acme\Generator"><arguments>
+                    <argument name="{arg}" xsi:type="array">
+                    <item name="{item}" xsi:type="string">{item}</item>
+                    </argument></arguments></type></config>"#
+                ),
+            )
+            .unwrap();
+            let config = super::parse_di_xml(&path).unwrap();
+            (path, config)
+        };
+        let configs = vec![
+            write("app/etc/di.xml", "fromPrimary", "entities"),
+            write("app/etc/extra/di.xml", "fromSubfolder", "entities"),
+            write("app/etc/other/di.xml", "fromOther", "replaced"),
+            write("vendor/acme/module/etc/di.xml", "fromModule", "replaced"),
+        ];
+
+        let merged = super::merge_global_di_configs(&configs, root);
+
+        let args = &merged.type_configs["Acme\\Generator"].arguments;
+        let items = |name: &str| {
+            let is_named = |a: &&super::Argument| matches!(a, super::Argument::Array { name: n, .. } if n == name);
+            let arg = args.iter().find(is_named).unwrap();
+            format!("{arg:?}")
+        };
+        // Primary files merge item by item with each other.
+        assert!(items("entities").contains("fromPrimary"));
+        assert!(items("entities").contains("fromSubfolder"));
+        // Modules replace a primary argument as a whole, also one from a subfolder.
+        assert!(items("replaced").contains("fromModule"));
+        assert!(!items("replaced").contains("fromOther"));
     }
 
     #[test]
