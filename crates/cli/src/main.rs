@@ -26,6 +26,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 mod class_checks;
+mod compile_scope;
 mod di_xml_checks;
 mod file_level_checks;
 use class_checks::{ClassChecks, ScannedFile};
@@ -569,9 +570,19 @@ fn main() {
         .collect();
     all_module_paths.sort();
     all_module_paths.dedup();
-    let (module_paths, disabled_module_paths) =
+    let (module_paths, mut disabled_module_paths) =
         split_disabled_modules(all_module_paths, &enabled_modules);
-    let php_files = walk_php_files(&module_paths);
+    let compiles_disabled_modules = compile_scope::compiles_disabled_modules(&magento_root)
+        .unwrap_or_else(|message| stop_compile(&message));
+    // The classes of disabled modules are either scanned, or lookups only. Their configuration
+    // and actions stay out in both cases, because Magento reads those by the module list.
+    let mut scanned_module_paths = module_paths.clone();
+    let mut not_listed_module_paths = Vec::new();
+    if compiles_disabled_modules {
+        not_listed_module_paths = std::mem::take(&mut disabled_module_paths);
+        scanned_module_paths.extend(not_listed_module_paths.iter().cloned());
+    }
+    let php_files = walk_php_files(&scanned_module_paths);
     log::info!("Found {} PHP files", php_files.len());
 
     let pb = progress_bar(php_files.len() as u64, "Extracting PHP classes");
@@ -1838,7 +1849,16 @@ fn main() {
         log_phase_elapsed("Phase 7 plugin-list loop", t_plugin_list);
 
         // App action list metadata.
-        let app_action_list = generate_app_action_list_php(&class_map);
+        let listed_classes: FxHashMap<String, ClassInfo> = class_map
+            .iter()
+            .filter(|(_, info)| {
+                !not_listed_module_paths
+                    .iter()
+                    .any(|root| info.path.starts_with(root))
+            })
+            .map(|(name, info)| (name.clone(), info.clone()))
+            .collect();
+        let app_action_list = generate_app_action_list_php(&listed_classes);
         let app_action_list_path = metadata_root.join("app_action_list.php");
         must_write(&app_action_list_path, &app_action_list);
         if let Err(e) =
