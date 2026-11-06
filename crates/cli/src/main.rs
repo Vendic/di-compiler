@@ -709,7 +709,12 @@ fn main() {
         &magento_root,
     );
     log::info!("Found {} di.xml files (all areas)", all_di_xml_files.len());
-    let di_xml_check = DiXmlCheck::start(all_di_xml_files.clone(), args.fallback_php.clone());
+    let di_xml_check = DiXmlCheck::start(
+        all_di_xml_files.clone(),
+        &magento_root,
+        &code_root,
+        args.fallback_php.clone(),
+    );
 
     // Only parse files not already in the global set
     let extra_di_files: Vec<_> = all_di_xml_files
@@ -1046,13 +1051,8 @@ fn main() {
         .collect();
     log_phase_elapsed("Phase 5", phase_5_started);
 
-    if let Err(message) = di_xml_check.finish() {
-        eprintln!("error: {message}");
-        std::process::exit(1);
-    }
-
     if args.dry_run {
-        if let Err(message) = class_checks.finish() {
+        if let Err(message) = di_xml_check.finish().and(class_checks.finish()) {
             eprintln!("error: {message}");
             std::process::exit(1);
         }
@@ -1304,7 +1304,7 @@ fn main() {
     log_phase_elapsed("Phase 6", phase_6_started);
 
     // Generated code is on disk now, so a failure can be checked against the real classes.
-    if let Err(message) = class_checks.finish() {
+    if let Err(message) = di_xml_check.finish().and(class_checks.finish()) {
         eprintln!("error: {message}");
         std::process::exit(1);
     }

@@ -2,17 +2,22 @@
 //!
 //! `Config\Reader\Filesystem::_readFiles()` hands each file to `Config\Dom::_initDom()`, which
 //! stops the compile when `DOMDocument::loadXML()` fails. The Rust parser accepts more than
-//! libxml does, so PHP answers this question. It runs beside the rest of the compile.
+//! libxml does, so PHP answers this question. `Scanner\XmlScanner::collectEntities()` then looks
+//! for proxies in the same files. It runs beside the rest of the compile.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 
-const CHECK_DI_XML_PHP: &str = r#"
+use crate::class_checks::BOOT_PHP;
+
+const VALID_XML_PHP: &str = r#"
 ini_set('display_errors', '0');
+[, $root, $generated] = $argv;
 libxml_use_internal_errors(true);
-foreach (file('php://stdin', FILE_IGNORE_NEW_LINES) as $file) {
+$files = file('php://stdin', FILE_IGNORE_NEW_LINES);
+foreach ($files as $file) {
     libxml_clear_errors();
     try {
         $loaded = (new DOMDocument())->loadXML((string) file_get_contents($file));
@@ -30,14 +35,67 @@ foreach (file('php://stdin', FILE_IGNORE_NEW_LINES) as $file) {
         exit(0);
     }
 }
+if (!is_file($root . '/vendor/autoload.php')) {
+    echo "valid\n";
+    exit(0);
+}
+"#;
+
+const PROXIES_PHP: &str = r#"
+ob_start();
+$names = [];
+$pattern = '/^(\s+)?(.*)\\\(.*)Proxy(\s+)?$/';
+$query = "/config/preference[ php:functionString('preg_match', '{$pattern}', @type) > 0]/@type | "
+    . "//argument[@xsi:type='object' and php:functionString('preg_match', '{$pattern}', text()) > 0] |"
+    . "//item[@xsi:type='object' and php:functionString('preg_match', '{$pattern}', text()) > 0] |"
+    . "/config/virtualType[ php:functionString('preg_match', '{$pattern}', @type) > 0]/@type";
+foreach ($files as $file) {
+    $dom = new DOMDocument();
+    $dom->load($file);
+    $xpath = new DOMXPath($dom);
+    $xpath->registerNamespace('php', 'http://php.net/xpath');
+    $xpath->registerPhpFunctions('preg_match');
+    // A file that does not declare the xsi prefix gives false here, in Magento too.
+    foreach (@$xpath->query($query) ?: [] as $node) {
+        $names[ltrim(trim($node->nodeValue), '\\')] = true;
+    }
+}
+$invalid = [];
+foreach (array_keys($names) as $name) {
+    $source = str_ends_with($name, '\\Proxy') ? substr($name, 0, -6) : $name;
+    try {
+        $exists = class_exists($name);
+    } catch (\RuntimeException) {
+        $exists = false;
+    }
+    if (!$exists && !class_exists($source) && !interface_exists($source)) {
+        $invalid[] = $name . ': Invalid proxy class for ' . rtrim(substr($name, 0, -5), '\\');
+    }
+}
+while (ob_get_level() > 0) {
+    ob_end_clean();
+}
+if ($invalid !== []) {
+    echo "invalid\nErrors during configuration scanning:\n", implode("\n", $invalid), "\n";
+    exit(0);
+}
 echo "valid\n";
 "#;
 
 pub(crate) struct DiXmlCheck(JoinHandle<Result<(), String>>);
 
 impl DiXmlCheck {
-    pub(crate) fn start(files: Vec<PathBuf>, php_bin: String) -> Self {
-        Self(std::thread::spawn(move || check(&files, &php_bin)))
+    pub(crate) fn start(
+        files: Vec<PathBuf>,
+        root: &Path,
+        code_root: &Path,
+        php_bin: String,
+    ) -> Self {
+        let root = root.to_path_buf();
+        let code_root = code_root.to_path_buf();
+        Self(std::thread::spawn(move || {
+            check(&files, &root, &code_root, &php_bin)
+        }))
     }
 
     /// The message Magento stops with, if it stops.
@@ -48,10 +106,15 @@ impl DiXmlCheck {
     }
 }
 
-fn check(files: &[PathBuf], php_bin: &str) -> Result<(), String> {
+fn check(files: &[PathBuf], root: &Path, code_root: &Path, php_bin: &str) -> Result<(), String> {
     let could_not_run = |reason: String| format!("Could not check di.xml files in PHP: {reason}");
     let spawned = Command::new(php_bin)
-        .args(["-d", "display_errors=0", "-r", CHECK_DI_XML_PHP])
+        .args(["-d", "display_errors=0", "-r"])
+        .arg(format!("{VALID_XML_PHP}{BOOT_PHP}{PROXIES_PHP}"))
+        .arg("--")
+        .arg(root)
+        .arg(code_root)
+        .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
