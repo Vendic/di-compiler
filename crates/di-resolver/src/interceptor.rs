@@ -292,7 +292,8 @@ fn derive_intercepted_methods_from_plugins(
             continue;
         };
 
-        for method in &plugin_info.public_methods {
+        // `Definition\Runtime::getMethodList()` uses `get_class_methods()`, so inherited count.
+        for method in collect_public_methods_with_inheritance(&plugin_info.fqcn, class_map) {
             if let Some(intercepted_method) = plugin_method_to_intercepted(&method.name) {
                 methods.insert(intercepted_method);
             }

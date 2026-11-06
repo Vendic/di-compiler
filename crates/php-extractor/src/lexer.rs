@@ -868,7 +868,8 @@ impl<'a> Scanner<'a> {
 
             let mut is_abstract_method = false;
             let mut is_final_method = false;
-            let mut is_public = false;
+            // A method without a visibility keyword is public.
+            let mut is_public = true;
             let mut is_static = false;
             let mut saw_function = false;
 
@@ -898,8 +899,8 @@ impl<'a> Scanner<'a> {
                 match current.to_ascii_lowercase().as_slice() {
                     b"abstract" => is_abstract_method = true,
                     b"final" => is_final_method = true,
-                    b"public" => is_public = true,
-                    b"private" | b"protected" => {}
+                    b"public" => {}
+                    b"private" | b"protected" => is_public = false,
                     b"static" => is_static = true,
                     b"readonly" => {}
                     b"function" => {
