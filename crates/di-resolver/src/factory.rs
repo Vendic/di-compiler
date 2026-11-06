@@ -20,19 +20,13 @@ pub fn detect_factories(
     class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
 ) -> Vec<FactorySpec> {
-    detect_factories_from_configs(
-        class_map,
-        di_config,
-        std::slice::from_ref(di_config),
-        di_config,
-    )
+    detect_factories_from_configs(class_map, std::slice::from_ref(di_config), di_config)
 }
 
-/// Detect factory classes using merged DI for preference resolution and
-/// raw per-file DI configs for XmlScanner-style candidate coverage.
+/// Detect factory classes using raw per-file DI configs for XmlScanner-style candidate
+/// coverage.
 pub fn detect_factories_from_configs(
     class_map: &FxHashMap<String, ClassInfo>,
-    merged_di_config: &DiConfig,
     scanner_di_configs: &[DiConfig],
     global_di_config: &DiConfig,
 ) -> Vec<FactorySpec> {
@@ -68,12 +62,9 @@ pub fn detect_factories_from_configs(
             return;
         }
 
-        let target = merged_di_config.get_preference(&factory_fqcn);
-        let target_fqcn = if target != factory_fqcn {
-            target
-        } else {
-            factory_fqcn[..factory_fqcn.len() - 7].to_string()
-        };
+        // `Code\Generator::generateClass()` takes the name without the suffix. A preference
+        // on the factory decides who gets the factory, not what the factory creates.
+        let target_fqcn = factory_fqcn[..factory_fqcn.len() - 7].to_string();
 
         // If the factory FQCN has no namespace separator it is root-namespace —
         // almost certainly a use-import resolution bug in our lexer. Suppress it
@@ -217,6 +208,23 @@ mod tests {
     }
 
     #[test]
+    fn test_factory_with_a_preference_still_creates_its_own_source_class() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "Foo\\Bar".to_string(),
+            make_class_with_ctor("Foo\\Bar", "Foo\\Baz\\WidgetFactory"),
+        );
+        let mut di_config = DiConfig::default();
+        di_config.preferences.insert(
+            "Foo\\Baz\\WidgetFactory".to_string(),
+            "Other\\WidgetFactory".to_string(),
+        );
+        di_config.refresh_lookup_indexes();
+        let specs = detect_factories(&class_map, &di_config);
+        assert_eq!(specs[0].target_fqcn, "Foo\\Baz\\Widget");
+    }
+
+    #[test]
     fn test_skips_existing_factory() {
         let mut class_map = FxHashMap::default();
         class_map.insert(
@@ -339,13 +347,7 @@ mod tests {
             },
         );
 
-        let merged_di_config = cfg2.clone();
-        let specs = detect_factories_from_configs(
-            &class_map,
-            &merged_di_config,
-            &[cfg1, cfg2],
-            &DiConfig::default(),
-        );
+        let specs = detect_factories_from_configs(&class_map, &[cfg1, cfg2], &DiConfig::default());
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].factory_fqcn, "Foo\\One\\WidgetFactory");
         assert_eq!(specs[1].factory_fqcn, "Foo\\Two\\WidgetFactory");
@@ -378,7 +380,6 @@ mod tests {
 
         let specs = detect_factories_from_configs(
             &class_map,
-            &area_cfg,
             std::slice::from_ref(&area_cfg),
             &DiConfig::default(),
         );

@@ -760,8 +760,7 @@ fn main() {
             .filter_map(|name| name.strip_suffix("\\Proxy").map(str::to_string)),
     );
 
-    let mut factories =
-        detect_factories_from_configs(&class_map, &full_di_config, &scanner_di_configs, &di_config);
+    let mut factories = detect_factories_from_configs(&class_map, &scanner_di_configs, &di_config);
     // `Reader::getConfigForScope()` reflects the target of every virtual type, and
     // a file-level check asks for a class by name. Either one generates the class.
     let virtual_type_names: FxHashSet<&str> = scanner_di_configs
