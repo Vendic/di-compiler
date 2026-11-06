@@ -43,6 +43,8 @@ if (!is_file($root . '/vendor/autoload.php')) {
 
 const PROXIES_PHP: &str = r#"
 ob_start();
+// `_initDom()` was the only reader that asks for these errors. A warning goes to the error handler.
+libxml_use_internal_errors(false);
 $names = [];
 $pattern = '/^(\s+)?(.*)\\\(.*)Proxy(\s+)?$/';
 $query = "/config/preference[ php:functionString('preg_match', '{$pattern}', @type) > 0]/@type | "
@@ -51,11 +53,19 @@ $query = "/config/preference[ php:functionString('preg_match', '{$pattern}', @ty
     . "/config/virtualType[ php:functionString('preg_match', '{$pattern}', @type) > 0]/@type";
 foreach ($files as $file) {
     $dom = new DOMDocument();
-    $dom->load($file);
+    try {
+        $dom->load($file);
+    } catch (\Exception $e) {
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+        echo "invalid\n", $e->getMessage(), "\n";
+        exit(0);
+    }
     $xpath = new DOMXPath($dom);
     $xpath->registerNamespace('php', 'http://php.net/xpath');
     $xpath->registerPhpFunctions('preg_match');
-    // A file that does not declare the xsi prefix gives false here, in Magento too.
+    // A file that does not declare the xsi prefix gives false here. Magento passes those too.
     foreach (@$xpath->query($query) ?: [] as $node) {
         $names[ltrim(trim($node->nodeValue), '\\')] = true;
     }

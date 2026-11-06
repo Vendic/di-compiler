@@ -247,3 +247,60 @@ fn broken_file_of_a_component_magento_does_not_register_does_not_stop_the_compil
     };
     assert_compiles(&output);
 }
+
+const ERROR_HANDLER: &str =
+    "<?php\nnamespace Magento\\Framework\\App;\n\nclass ErrorHandler\n{\n    \
+     public function handler($number, $text, $file, $line)\n    {\n        \
+     if (($number & error_reporting()) === 0) {\n            return false;\n        }\n        \
+     throw new \\Exception($text . ' in ' . $file);\n    }\n}\n";
+
+#[test]
+fn warning_while_a_class_file_loads_stops_the_compile_as_bin_magento_turns_it_into_an_exception() {
+    let Some(output) = compile_with(&[
+        (
+            "app/code/Magento/Framework/App/ErrorHandler.php",
+            ERROR_HANDLER,
+        ),
+        (
+            THING,
+            &model("trigger_error('careful', E_USER_WARNING);\nclass Thing {}"),
+        ),
+    ]) else {
+        return;
+    };
+    assert_stops(&output, &["Model/Thing.php", "careful"]);
+}
+
+#[test]
+fn deprecation_while_a_class_file_compiles_stops_the_compile() {
+    let Some(output) = compile_with(&[
+        (
+            "app/code/Magento/Framework/App/ErrorHandler.php",
+            ERROR_HANDLER,
+        ),
+        (
+            THING,
+            &model("class Thing { public function run(Gadget $g = null, $x) {} }"),
+        ),
+    ]) else {
+        return;
+    };
+    assert_stops(&output, &["Model/Thing.php"]);
+}
+
+#[test]
+fn suppressed_warning_in_a_class_file_compiles() {
+    let Some(output) = compile_with(&[
+        (
+            "app/code/Magento/Framework/App/ErrorHandler.php",
+            ERROR_HANDLER,
+        ),
+        (
+            THING,
+            &model("@trigger_error('careful', E_USER_WARNING);\nclass Thing {}"),
+        ),
+    ]) else {
+        return;
+    };
+    assert_compiles(&output);
+}
