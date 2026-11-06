@@ -465,6 +465,41 @@ impl PhpWorkerPool {
 
 static PHP_WORKER_POOL: OnceLock<PhpWorkerPool> = OnceLock::new();
 
+/// `bin/magento` starts with `app/bootstrap.php`, so a store where that fails stops at once. Here
+/// every later PHP process would fail the same way, one by one and without saying why.
+fn stop_when_php_cannot_start(php_bin: &str, magento_root: &Path) {
+    // Without an autoloader this is not a Magento store, and PHP can load nothing.
+    if !magento_root.join("vendor/autoload.php").is_file() {
+        return;
+    }
+    const STARTED: &str = "fast-di-compile: PHP started";
+    let script = format!(
+        "$root = $argv[1]; require is_file($root . '/app/bootstrap.php') ? $root . '/app/bootstrap.php' : $root . '/vendor/autoload.php'; echo '{STARTED}';"
+    );
+    let output = Command::new(php_bin)
+        .args(["-d", "display_errors=1", "-d", "html_errors=0", "-r"])
+        .arg(script)
+        .arg("--")
+        .arg(magento_root)
+        .current_dir(magento_root)
+        .stdin(Stdio::null())
+        .output();
+    // Without a PHP binary nothing can run in PHP, here or in any other phase.
+    let Ok(output) = output else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() && stdout.contains(STARTED) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stop_compile(&format!(
+        "PHP cannot start this store, exit code {:?}: {}",
+        output.status.code(),
+        format!("{}\n{}", stdout.trim(), stderr.trim()).trim()
+    ));
+}
+
 fn init_php_worker_pool(php_bin: &str, magento_root: &Path, code_root: &Path) -> PathBuf {
     let script_path =
         std::env::temp_dir().join(format!("fast-di-worker-{}.php", std::process::id()));
@@ -538,6 +573,8 @@ fn main() {
         );
         std::process::exit(1);
     }
+
+    stop_when_php_cannot_start(&args.fallback_php, &magento_root);
 
     // Initialise the persistent PHP worker pool (one autoload per worker process).
     let worker_script_path = init_php_worker_pool(&args.fallback_php, &magento_root, &code_root);
