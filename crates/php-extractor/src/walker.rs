@@ -212,6 +212,8 @@ fn collect_php_files(root: &Path, kind: Option<ComponentKind>) -> Vec<PathBuf> {
     let mut builder = WalkBuilder::new(root);
     // `ClassesScanner` knows no ignore files and walks into folders that start with a dot.
     builder.standard_filters(false);
+    // `ClassesScanner::getList()` walks with `FilesystemIterator::FOLLOW_SYMLINKS`.
+    builder.follow_links(true);
     builder.types(php_types);
     let walk_root = root.to_path_buf();
     builder.filter_entry(move |entry| {
