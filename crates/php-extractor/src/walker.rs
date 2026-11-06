@@ -67,6 +67,8 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
     // Other third-party vendor modules: vendor/{vendor}/{package}/.../registration.php
     // Discover module roots from registration.php paths inside each package.
     let vendor_dir = magento_root.join("vendor");
+    let composer_files =
+        std::fs::read_to_string(vendor_dir.join("composer/autoload_files.php")).ok();
     if let Ok(vendors) = std::fs::read_dir(&vendor_dir) {
         for vendor in vendors.flatten() {
             if vendor
@@ -88,7 +90,9 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
                         continue;
                     }
                     for module_root in discover_module_roots_from_registration(&mpath) {
-                        paths.push(module_root);
+                        if composer_loads_registration(&composer_files, &vendor_dir, &module_root) {
+                            paths.push(module_root);
+                        }
                     }
                 }
             }
@@ -98,6 +102,19 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+/// `ComponentRegistrar` only hears from a `registration.php` that Composer loads. A file of that
+/// name elsewhere in a package is not a registration. Without the Composer list, the file counts.
+fn composer_loads_registration(
+    composer_files: &Option<String>,
+    vendor_dir: &Path,
+    module_root: &Path,
+) -> bool {
+    let (Some(list), Ok(package)) = (composer_files, module_root.strip_prefix(vendor_dir)) else {
+        return true;
+    };
+    list.contains(&format!("/{}/registration.php'", package.display()))
 }
 
 /// `DiCompileCommand` scans the paths in `ComponentRegistrar`. A `registration.php` is only a plain
