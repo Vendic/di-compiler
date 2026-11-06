@@ -309,3 +309,126 @@ fn proxy_named_by_enabled_code_is_generated_for_a_disabled_class() {
         .join("generated/code/Acme/Off/Api/GatewayInterface/Proxy.php")
         .exists());
 }
+
+const COMPILE_COMMAND: &str = "setup/src/Magento/Setup/Console/Command/DiCompileCommand.php";
+
+/// Written from scratch: only the lines that decide which modules `execute()` compiles.
+fn compile_command(execute_body: &str) -> String {
+    format!(
+        "<?php\nnamespace Magento\\Setup\\Console\\Command;\n\nclass DiCompileCommand\n{{\n    protected function execute()\n    {{\n{execute_body}\n    }}\n}}\n"
+    )
+}
+
+const COMMAND_WITH_ALL_MODULES: &str = r#"        $modulePaths = $this->componentRegistrar->getPaths(ComponentRegistrar::MODULE);
+        $compiledPathsList = [
+            'application' => $modulePaths,
+            'library' => $libraryPaths,
+        ];"#;
+
+const COMMAND_WITH_ENABLED_MODULES: &str = r#"        $modulePaths = $this->componentRegistrar->getPaths(ComponentRegistrar::MODULE);
+        $moduleStatuses = $this->deploymentConfig->get(ConfigOptionsListConstants::KEY_MODULES);
+        $modulePathsEnabled = array_filter($modulePaths, function ($path, $module) use ($moduleStatuses) {
+            return ($moduleStatuses[$module] ?? 0) === 1;
+        }, ARRAY_FILTER_USE_BOTH);
+        $compiledPathsList = [
+            'application' => $modulePathsEnabled,
+            'library' => $libraryPaths,
+        ];"#;
+
+fn compiled_with_command(execute_body: &str) -> tempfile::TempDir {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_fixture(tmp.path());
+    write(tmp.path(), COMPILE_COMMAND, &compile_command(execute_body));
+    compile(tmp.path());
+    tmp
+}
+
+#[test]
+fn store_whose_command_compiles_all_modules_scans_disabled_classes() {
+    let tmp = compiled_with_command(COMMAND_WITH_ALL_MODULES);
+    let root = tmp.path();
+
+    let global = read(root, "generated/metadata/global.php");
+    let (arguments, _) = global.split_once("'preferences' =>").unwrap();
+    assert!(arguments.contains(&key("Acme\\Off\\Model\\Hidden")));
+    assert!(root
+        .join("generated/code/Acme/Off/Model/DisabledFactory.php")
+        .exists());
+    assert!(root
+        .join("generated/code/Acme/Unlisted/Model/DisabledFactory.php")
+        .exists());
+}
+
+#[test]
+fn store_whose_command_compiles_all_modules_gives_a_disabled_class_its_interceptor() {
+    let tmp = compiled_with_command(COMMAND_WITH_ALL_MODULES);
+    let root = tmp.path();
+
+    assert!(root
+        .join("generated/code/Acme/Off/Model/Owned/Interceptor.php")
+        .exists());
+    let global = read(root, "generated/metadata/global.php");
+    let (_, preferences) = global.split_once("'preferences' =>").unwrap();
+    assert!(preferences.contains(&key("Acme\\Off\\Model\\Owned")));
+}
+
+#[test]
+fn store_whose_command_compiles_all_modules_still_reads_only_enabled_module_config() {
+    let tmp = compiled_with_command(COMMAND_WITH_ALL_MODULES);
+    let root = tmp.path();
+
+    // `Dir\Reader::getActionFiles()` and the extension attributes reader use the module list.
+    let actions = read(root, "generated/metadata/app_action_list.php");
+    assert!(actions.contains("acme\\\\on\\\\controller\\\\index\\\\index"));
+    assert!(!actions.contains("acme\\\\off\\\\"));
+    assert!(!actions.contains("acme\\\\unlisted\\\\"));
+    let extension = read(root, "generated/code/Acme/On/Api/Data/ThingExtension.php");
+    assert!(!extension.contains("getFromDisabled"));
+}
+
+#[test]
+fn store_whose_command_filters_modules_does_not_scan_disabled_classes() {
+    let tmp = compiled_with_command(COMMAND_WITH_ENABLED_MODULES);
+    let root = tmp.path();
+
+    let global = read(root, "generated/metadata/global.php");
+    assert!(!global.contains(&key("Acme\\Off\\Model\\Hidden")));
+    assert!(!root
+        .join("generated/code/Acme/Off/Model/Owned/Interceptor.php")
+        .exists());
+}
+
+#[test]
+fn commented_out_line_in_the_command_does_not_count() {
+    let body = format!(
+        "        // 'application' => $modulePathsEnabled,\n        /* 'application' => $other, */\n{COMMAND_WITH_ALL_MODULES}"
+    );
+    let tmp = compiled_with_command(&body);
+
+    assert!(tmp
+        .path()
+        .join("generated/code/Acme/Off/Model/Owned/Interceptor.php")
+        .exists());
+}
+
+#[test]
+fn command_of_an_unknown_shape_stops_the_compile() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_fixture(tmp.path());
+    write(
+        tmp.path(),
+        COMPILE_COMMAND,
+        &compile_command("        $compiledPathsList = $this->somethingNew();"),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_fast-di-compile"))
+        .arg("--magento-root")
+        .arg(tmp.path())
+        .arg("--fallback-php")
+        .arg(tmp.path().join("no-php-here"))
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("DiCompileCommand.php"), "{stderr}");
+}
