@@ -1,5 +1,6 @@
 //! `PluginListGenerator::inheritPlugins()` throws "Plugin class X doesn't exist" for a plugin
-//! that is not disabled and whose class fails `class_exists()`. That stops the compile.
+//! that is not disabled and whose class fails `class_exists()`. That stops the compile. A disabled
+//! plugin of a scanned concrete class stops it later, in `Definition\Runtime::getMethodList()`.
 
 use std::fs;
 use std::path::Path;
@@ -154,11 +155,58 @@ fn virtual_type_as_plugin_is_checked_by_its_real_class() {
 }
 
 #[test]
-fn disabled_plugin_with_a_missing_class_does_not_stop_the_compile() {
+fn disabled_plugin_with_a_missing_class_on_a_scanned_class_stops_the_compile() {
+    // `getInterceptedMethods()` calls `get_class_methods()` on every plugin in the inherited
+    // list, and disabled plugins stay in that list.
     let Some(output) = compile_with(&[(
         MODULE_DI,
         plugin_on_gadget("type=\"Acme\\On\\Plugin\\Gone\" disabled=\"true\""),
     )]) else {
+        return;
+    };
+    assert_stops_on(&output, "Acme\\On\\Plugin\\Gone");
+}
+
+#[test]
+fn disabled_plugin_with_a_missing_class_on_an_interface_only_compiles() {
+    let Some(output) = compile_with(&[(
+        MODULE_DI,
+        di_xml(
+            "<type name=\"Acme\\On\\Plugin\\Contract\"><plugin name=\"p\" type=\"Acme\\On\\Plugin\\Gone\" disabled=\"true\"/></type>",
+        ),
+    )]) else {
+        return;
+    };
+    assert_compiles(&output);
+}
+
+#[test]
+fn disabled_plugin_with_a_missing_class_on_a_class_outside_the_scan_compiles() {
+    let Some(output) = compile_with(&[(
+        MODULE_DI,
+        di_xml(
+            "<type name=\"Acme\\Elsewhere\\Thing\"><plugin name=\"p\" type=\"Acme\\On\\Plugin\\Gone\" disabled=\"true\"/></type>",
+        ),
+    )]) else {
+        return;
+    };
+    assert_compiles(&output);
+}
+
+#[test]
+fn disabled_plugin_whose_class_is_an_interface_compiles_because_get_class_methods_accepts_it() {
+    let Some(output) = compile_with(&[(
+        MODULE_DI,
+        plugin_on_gadget("type=\"Acme\\On\\Plugin\\Contract\" disabled=\"true\""),
+    )]) else {
+        return;
+    };
+    assert_compiles(&output);
+}
+
+#[test]
+fn disabling_a_plugin_without_naming_a_class_compiles() {
+    let Some(output) = compile_with(&[(MODULE_DI, plugin_on_gadget("disabled=\"true\""))]) else {
         return;
     };
     assert_compiles(&output);
@@ -182,7 +230,7 @@ fn plugin_disabled_in_one_area_still_stops_on_the_scopes_where_it_runs() {
 }
 
 #[test]
-fn plugin_disabled_in_the_global_file_by_another_module_does_not_stop_the_compile() {
+fn plugin_disabled_in_the_global_file_by_another_module_still_stops_the_compile() {
     let Some(output) = compile_with(&[
         (
             MODULE_DI,
@@ -195,7 +243,7 @@ fn plugin_disabled_in_the_global_file_by_another_module_does_not_stop_the_compil
     ]) else {
         return;
     };
-    assert_compiles(&output);
+    assert_stops_on(&output, "Acme\\On\\Plugin\\Gone");
 }
 
 #[test]
