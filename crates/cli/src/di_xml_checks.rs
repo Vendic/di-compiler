@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 
-use crate::class_checks::BOOT_PHP;
+use crate::class_checks::{BOOT_PHP, OBJECT_MANAGER_PHP};
 
 const VALID_XML_PHP: &str = r#"
 ini_set('display_errors', '0');
@@ -147,7 +147,9 @@ fn check(
     let could_not_run = |reason: String| format!("Could not check di.xml files in PHP: {reason}");
     let spawned = Command::new(php_bin)
         .args(["-d", "display_errors=0", "-r"])
-        .arg(format!("{VALID_XML_PHP}{BOOT_PHP}{PROXIES_PHP}"))
+        .arg(format!(
+            "{VALID_XML_PHP}{BOOT_PHP}{OBJECT_MANAGER_PHP}{PROXIES_PHP}"
+        ))
         .arg("--")
         .arg(root)
         .arg(code_root)

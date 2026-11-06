@@ -177,6 +177,7 @@ if ($root === '' || !file_exists($root . '/vendor/autoload.php')) {
     exit(1);
 }
 @require $root . '/vendor/autoload.php';
+// OBJECT MANAGER
 // Magento's Autoload\Populator adds the generation directory. Composer remembers a class it
 // did not find, and this worker can outlive that moment, so this loader looks again each time.
 $generated = $argv[2] ?? '';
@@ -466,8 +467,11 @@ static PHP_WORKER_POOL: OnceLock<PhpWorkerPool> = OnceLock::new();
 fn init_php_worker_pool(php_bin: &str, magento_root: &Path, code_root: &Path) -> PathBuf {
     let script_path =
         std::env::temp_dir().join(format!("fast-di-worker-{}.php", std::process::id()));
-    std::fs::write(&script_path, WORKER_PHP)
-        .expect("failed to write PHP worker script to temp dir");
+    std::fs::write(
+        &script_path,
+        WORKER_PHP.replace("// OBJECT MANAGER", class_checks::OBJECT_MANAGER_PHP),
+    )
+    .expect("failed to write PHP worker script to temp dir");
     PHP_WORKER_POOL.get_or_init(|| {
         PhpWorkerPool::new(
             php_bin.to_string(),

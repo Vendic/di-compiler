@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use php_extractor::{lexer::Lexer, ClassInfo};
+
+use crate::class_checks::OBJECT_MANAGER_PHP;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
@@ -25,6 +27,7 @@ $asked = [];
 ob_start();
 try {
     require $root . '/vendor/autoload.php';
+    // OBJECT MANAGER
     spl_autoload_register(function (string $name) use (&$asked): void {
         $source = match (true) {
             str_ends_with($name, '\\Proxy') => substr($name, 0, -6),
@@ -117,7 +120,9 @@ fn run_class_file(
     php_bin: &str,
 ) -> Option<FileOutcome> {
     let output = Command::new(php_bin)
-        .args(["-d", "display_errors=0", "-r", RUN_CLASS_FILE_PHP, "--"])
+        .args(["-d", "display_errors=0", "-r"])
+        .arg(RUN_CLASS_FILE_PHP.replace("// OBJECT MANAGER", OBJECT_MANAGER_PHP))
+        .arg("--")
         .arg(magento_root)
         .arg(fqcn)
         .arg(path)
