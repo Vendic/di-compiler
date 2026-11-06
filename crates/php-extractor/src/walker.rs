@@ -34,6 +34,21 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
         }
     }
 
+    // lib/internal/*/* and lib/internal/*/*/*, as in app/etc/registration_globlist.php
+    let lib_internal = magento_root.join("lib/internal");
+    for vendor in subfolders(&lib_internal) {
+        for package in subfolders(&vendor) {
+            if package.join("registration.php").exists() {
+                paths.push(package.clone());
+            }
+            for nested in subfolders(&package) {
+                if nested.join("registration.php").exists() {
+                    paths.push(nested);
+                }
+            }
+        }
+    }
+
     // vendor/magento/framework (library, no registration.php at root)
     let framework = magento_root.join("vendor/magento/framework");
     if framework.is_dir() && !paths.contains(&framework) {
@@ -83,6 +98,18 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn subfolders(folder: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(folder)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn discover_module_roots_from_registration(package_root: &Path) -> Vec<PathBuf> {
@@ -281,6 +308,21 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, "<?php").unwrap();
+    }
+
+    #[test]
+    fn libraries_in_lib_internal_are_found_at_both_depths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        touch(root, "lib/internal/Acme/Lib/registration.php");
+        touch(root, "lib/internal/Acme/Deep/Lib/registration.php");
+        touch(root, "lib/internal/Acme/Plain/Thing.php");
+
+        let paths = read_module_paths(root);
+
+        assert!(paths.contains(&root.join("lib/internal/Acme/Lib")));
+        assert!(paths.contains(&root.join("lib/internal/Acme/Deep/Lib")));
+        assert!(!paths.contains(&root.join("lib/internal/Acme/Plain")));
     }
 
     #[test]
