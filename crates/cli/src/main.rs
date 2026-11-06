@@ -869,6 +869,13 @@ fn main() {
         factories.retain(|spec| !index.is_loadable(&spec.factory_fqcn));
     }
     factories.retain(|spec| !disabled_class_map.contains_key(&spec.factory_fqcn));
+    // Magento's generator needs a source class, and PHP also knows built-in classes. Without
+    // this, the worker would find a factory on disk that Magento never has, and the check of
+    // constructor parameters would pass.
+    factories.retain(|spec| {
+        generated_class_source_exists(&spec.target_fqcn, &source_exists)
+            || plugin_class_failure(&spec.target_fqcn).is_none()
+    });
     let proxies = detect_proxies_from_configs_with_existing(
         &class_map,
         &scanner_di_configs,
@@ -1879,6 +1886,33 @@ fn main() {
 
     // Clean up the temp PHP worker script.
     let _ = std::fs::remove_file(&worker_script_path);
+}
+
+/// True for a class that exists, or that Magento's generator can make from a class that exists.
+fn generated_class_source_exists(class: &str, source_exists: &impl Fn(&str) -> bool) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "\\Proxy",
+        "\\Interceptor",
+        "\\ProxyDeferred",
+        "\\Remote",
+        "\\Logger",
+        "Factory",
+        "Mapper",
+        "Persistor",
+        "Repository",
+        "Converter",
+        "SearchResults",
+        "ExtensionInterface",
+        "Extension",
+    ];
+    source_exists(class)
+        || SUFFIXES.iter().any(|suffix| {
+            class.strip_suffix(suffix).is_some_and(|source| {
+                !source.is_empty()
+                    && (generated_class_source_exists(source, source_exists)
+                        || source_exists(&format!("{source}Interface")))
+            })
+        })
 }
 
 fn progress_bar(len: u64, msg: &str) -> ProgressBar {

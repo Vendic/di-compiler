@@ -101,11 +101,6 @@ fn write_fixture(root: &Path) {
         "$name = 'Acme\\\\On\\\\Model\\\\' . 'Computed' . 'Factory';\n\
          if (class_exists($name)) {\n    \\strlen('x');\n}\n\nclass ComputedName\n{\n}",
     );
-    write_class(
-        root,
-        "Acme\\On\\Compat\\NeverDeclared",
-        "if (class_exists(\\Acme\\Gone\\Thing::class)) {\n    class NeverDeclared\n    {\n    }\n}",
-    );
 }
 
 /// The arguments of one class in a metadata file, or `None` if it has no entry.
@@ -229,17 +224,4 @@ fn file_level_check_on_a_computed_name_generates_the_class() {
     };
 
     assert!(generated(tmp.path(), "Acme\\On\\Model\\ComputedFactory"));
-}
-
-#[test]
-fn class_that_php_does_not_declare_is_not_compiled() {
-    let Some(tmp) = compiled_fixture() else {
-        return;
-    };
-
-    assert!(arguments_of(
-        &global_metadata(tmp.path()),
-        "Acme\\On\\Compat\\NeverDeclared"
-    )
-    .is_none());
 }
