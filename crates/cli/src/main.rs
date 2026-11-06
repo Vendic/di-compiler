@@ -5057,22 +5057,22 @@ fn enrich_interceptor_specs_with_reflection(
     // -----------------------------------------------------------------
     for spec in specs.iter_mut() {
         let needs_sig = interceptor_methods_need_reflection_normalization(&spec.public_methods);
-        let expected = if spec.plugins.is_empty() {
+        let mut expected = if spec.plugins.is_empty() {
             FxHashSet::default()
         } else {
             compute_expected_method_names(&spec.plugins, class_map, di_config, &plugin_method_map)
         };
+        expected.extend(methods_asked_beyond_the_scan(
+            &spec.fqcn, class_map, di_config,
+        ));
 
-        if spec.plugins.is_empty() && !needs_sig {
-            continue;
-        }
-        if !spec.plugins.is_empty() && expected.is_empty() && !needs_sig {
+        if expected.is_empty() && !needs_sig {
             continue;
         }
 
         let current: FxHashSet<String> =
             spec.public_methods.iter().map(|m| m.name.clone()).collect();
-        let missing_expected = !spec.plugins.is_empty() && !expected.is_subset(&current);
+        let missing_expected = !expected.is_subset(&current);
         if !missing_expected && !needs_sig {
             continue;
         }
@@ -5127,11 +5127,13 @@ fn spec_needs_reflection(
     if interceptor_methods_need_reflection_normalization(&spec.public_methods) {
         return true;
     }
-    if spec.plugins.is_empty() {
+    let beyond_scan = methods_asked_beyond_the_scan(&spec.fqcn, class_map, di_config);
+    if spec.plugins.is_empty() && beyond_scan.is_empty() {
         return false;
     }
-    let expected =
+    let mut expected =
         compute_expected_method_names(&spec.plugins, class_map, di_config, plugin_method_map);
+    expected.extend(beyond_scan);
     if expected.is_empty() {
         return false;
     }
@@ -5141,6 +5143,33 @@ fn spec_needs_reflection(
         .map(|m| m.name.as_str())
         .collect();
     !expected.iter().all(|e| current.contains(e.as_str()))
+}
+
+/// What the plugins on this class and its parents ask for, when a parent lies outside the scan.
+/// The scan cannot see the methods of such a parent, and Magento takes them from reflection.
+fn methods_asked_beyond_the_scan(
+    fqcn: &str,
+    class_map: &FxHashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+) -> FxHashSet<String> {
+    let mut seen = FxHashSet::default();
+    let mut current = class_map.get(fqcn);
+    while let Some(info) = current {
+        let Some(parent) = info.extends.as_deref() else {
+            return FxHashSet::default();
+        };
+        let parent = parent.trim_start_matches('\\');
+        if !seen.insert(parent) {
+            return FxHashSet::default();
+        }
+        current = class_map.get(parent);
+        if current.is_none() {
+            return di_resolver::interceptor::derive_intercepted_methods_from_ancestor_plugins(
+                fqcn, class_map, di_config,
+            );
+        }
+    }
+    FxHashSet::default()
 }
 
 /// Compute the set of intercepted method names expected from a plugin list,
