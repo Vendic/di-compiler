@@ -296,6 +296,10 @@ function preference_target(string $class) {
     if ($exists !== true) return $exists === false ? 'missing' : $exists;
     return class_exists($class, false) && (new ReflectionClass($class))->getExtension() !== null ? 'extension' : 'class';
 }
+function is_readonly_class(string $class): bool {
+    return class_exists($class) && method_exists(ReflectionClass::class, 'isReadOnly')
+        && (new ReflectionClass($class))->isReadOnly();
+}
 function reflect_const(string $expr) {
     $expr = ltrim($expr, '\\');
     if ($expr === '' || !defined($expr)) return null;
@@ -332,6 +336,7 @@ while (($line = fgets($stdin)) !== false) {
             'plugin_class_exists' => plugin_class_exists($class),
             'preference_target' => preference_target($class),
             'class_like_exists' => class_like_exists($class),
+            'is_readonly_class' => is_readonly_class($class),
             default   => null,
         };
         fwrite(STDOUT, json_encode($result) . "\n");
@@ -987,6 +992,31 @@ fn main() {
         }
         !spec.plugins.is_empty() // Setup class with direct plugins — keep; inherited-only — drop
     });
+    // The generated interceptor of a readonly class is a fatal error when Magento loads it.
+    let setup_root = magento_root.join("setup");
+    let mut readonly_classes: Vec<&str> = interceptors
+        .par_iter()
+        .filter(|spec| {
+            class_map.get(spec.fqcn.as_str()).is_some_and(|info| {
+                !info.path.starts_with(&setup_root)
+                    && std::fs::read_to_string(&info.path)
+                        .is_ok_and(|source| source.contains("readonly"))
+            })
+        })
+        .map(|spec| spec.fqcn.as_str())
+        .filter(|class| {
+            PHP_WORKER_POOL
+                .get()
+                .and_then(|pool| pool.request(&format!("is_readonly_class:{class}")))
+                .is_some_and(|answer| answer.trim() == "true")
+        })
+        .collect();
+    readonly_classes.sort();
+    if let Some(class) = readonly_classes.first() {
+        stop_compile(&format!(
+            "Non-readonly class {class}\\Interceptor cannot extend readonly class {class}"
+        ));
+    }
     enrich_interceptor_specs_with_reflection(
         &mut interceptors,
         &interception_class_map,
