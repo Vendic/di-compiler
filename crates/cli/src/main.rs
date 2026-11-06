@@ -2011,8 +2011,12 @@ fn compute_phase7_fp(
             h.write_u8(0);
             h.write(p.type_name.as_bytes());
             h.write_u8(0);
-            h.write_i32(p.sort_order);
-            h.write_u8(p.disabled as u8);
+            h.write_i32(p.effective_sort_order());
+            h.write_u8(match p.disabled {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            });
         }
     }
 
@@ -3408,7 +3412,7 @@ fn build_interception_registry(
     // (e.g. abstract classes/interfaces used only as plugin declaration owners).
     // Normalize the owner name to strip any leading backslash so it matches type_names.
     intercepted_targets.extend(di_config.plugins.iter().filter_map(|(owner, plugins)| {
-        if plugins.iter().any(|plugin| !plugin.disabled) {
+        if plugins.iter().any(|plugin| plugin.is_active()) {
             Some(owner.trim_start_matches('\\').to_string())
         } else {
             None
@@ -4411,22 +4415,7 @@ fn merge_plugins_for_interception(
                     None => {
                         owner_plugins.insert(plugin.name.clone(), plugin.clone());
                     }
-                    Some(existing) => {
-                        if plugin.type_name.is_empty() {
-                            // Disabled-only override: preserve type_name, update disabled flag.
-                            existing.disabled = plugin.disabled;
-                            if plugin.sort_order != 0 {
-                                existing.sort_order = plugin.sort_order;
-                            }
-                        } else {
-                            let was_disabled = existing.disabled;
-                            *existing = plugin.clone();
-                            // PHP sticky-disabled: once disabled, stays disabled.
-                            if was_disabled {
-                                existing.disabled = true;
-                            }
-                        }
-                    }
+                    Some(existing) => existing.merge_same_scope(plugin.clone()),
                 }
             }
         }
@@ -4437,8 +4426,17 @@ fn merge_plugins_for_interception(
         for (owner, plugins) in &cfg.plugins {
             let owner_plugins = merged.entry(owner.clone()).or_default();
             for plugin in plugins {
-                if plugin.disabled {
+                if plugin.is_disabled() {
                     // Area-specific disables do not remove globally active plugins.
+                    continue;
+                }
+                if plugin.type_name.is_empty() {
+                    // An override with no class only matters when it re-enables a plugin.
+                    if let Some(existing) = owner_plugins.get_mut(&plugin.name) {
+                        if plugin.disabled.is_some() {
+                            existing.disabled = plugin.disabled;
+                        }
+                    }
                     continue;
                 }
                 match owner_plugins.get_mut(&plugin.name) {
@@ -4446,7 +4444,7 @@ fn merge_plugins_for_interception(
                         owner_plugins.insert(plugin.name.clone(), plugin.clone());
                     }
                     Some(existing) => {
-                        if existing.disabled {
+                        if existing.is_disabled() {
                             // Plugin disabled globally but active in this area — re-enable.
                             *existing = plugin.clone();
                         }
@@ -4459,7 +4457,11 @@ fn merge_plugins_for_interception(
     let mut out = FxHashMap::default();
     for (owner, by_name) in merged {
         let mut plugins: Vec<Plugin> = by_name.into_values().collect();
-        plugins.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.name.cmp(&b.name)));
+        plugins.sort_by(|a, b| {
+            a.effective_sort_order()
+                .cmp(&b.effective_sort_order())
+                .then(a.name.cmp(&b.name))
+        });
         out.insert(owner, plugins);
     }
     out
@@ -4488,6 +4490,9 @@ fn augment_with_composer_plugin_owner_classes(
     }
     for plugins in di_config.plugins.values() {
         for plugin in plugins {
+            if plugin.type_name.is_empty() {
+                continue;
+            }
             let plugin_type = plugin.type_name.trim_start_matches('\\').to_string();
             if !class_map.contains_key(&plugin_type) {
                 candidates.insert(plugin_type.clone());

@@ -20,8 +20,32 @@ const LISTENER_AFTER: u8 = 4;
 pub struct PluginConfig {
     pub name: String,
     pub sort_order: i32,
+    /// Empty when no scope or parent has given this entry a class yet.
     pub instance: String,
-    pub disabled: bool,
+    /// `None` when no declaration sets `disabled`. Magento then writes no key.
+    pub disabled: Option<bool>,
+    /// Magento keeps array keys in first-seen order, so this row lists `disabled` last.
+    pub disabled_after_instance: bool,
+}
+
+impl PluginConfig {
+    fn is_disabled(&self) -> bool {
+        self.disabled == Some(true)
+    }
+
+    /// array_replace_recursive() of two rows, as in `PluginListGenerator::inheritPlugins()`.
+    fn replace_with(&mut self, later: &PluginConfig) {
+        if !self.instance.is_empty() && self.disabled.is_none() && later.disabled.is_some() {
+            self.disabled_after_instance = true;
+        }
+        self.sort_order = later.sort_order;
+        if !later.instance.is_empty() {
+            self.instance = later.instance.clone();
+        }
+        if later.disabled.is_some() {
+            self.disabled = later.disabled;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -347,7 +371,7 @@ fn inherit_plugins(
 
         let mut last_per_method: FxHashMap<String, String> = FxHashMap::default();
         for plugin in &sorted_plugins {
-            if plugin.disabled {
+            if plugin.is_disabled() {
                 continue;
             }
             let plugin_type = normalize(&di_config.get_instance_type(&plugin.instance));
@@ -408,7 +432,7 @@ fn get_parents(type_name: &str, class_map: &FxHashMap<String, ClassInfo>) -> Vec
 fn merge_plugin_lists(dst: &mut Vec<PluginConfig>, src: &[PluginConfig]) {
     for src_plugin in src {
         if let Some(existing) = dst.iter_mut().find(|p| p.name == src_plugin.name) {
-            *existing = src_plugin.clone();
+            existing.replace_with(src_plugin);
         } else {
             dst.push(src_plugin.clone());
         }
@@ -418,9 +442,10 @@ fn merge_plugin_lists(dst: &mut Vec<PluginConfig>, src: &[PluginConfig]) {
 fn from_di_plugin(plugin: &DiPlugin) -> PluginConfig {
     PluginConfig {
         name: plugin.name.clone(),
-        sort_order: plugin.sort_order,
+        sort_order: plugin.effective_sort_order(),
         instance: normalize(&plugin.type_name),
         disabled: plugin.disabled,
+        disabled_after_instance: plugin.disabled_after_type,
     }
 }
 
@@ -508,13 +533,22 @@ fn serialize_plugin_map(out: &mut String, plugins: &[PluginConfig], indent: usiz
             pad
         ));
         out.push_str(&format!("{}  'sortOrder' => {},\n", pad, plugin.sort_order));
-        out.push_str(&format!(
-            "{}  'instance' => '{}',\n",
-            pad,
-            escape_php(&plugin.instance)
-        ));
-        if plugin.disabled {
-            out.push_str(&format!("{}  'disabled' => true,\n", pad));
+        let disabled = plugin
+            .disabled
+            .map(|disabled| format!("{}  'disabled' => {},\n", pad, disabled))
+            .unwrap_or_default();
+        if !plugin.disabled_after_instance {
+            out.push_str(&disabled);
+        }
+        if !plugin.instance.is_empty() {
+            out.push_str(&format!(
+                "{}  'instance' => '{}',\n",
+                pad,
+                escape_php(&plugin.instance)
+            ));
+        }
+        if plugin.disabled_after_instance {
+            out.push_str(&disabled);
         }
         out.push_str(&format!("{}),\n", pad));
     }
@@ -527,7 +561,7 @@ fn normalize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use di_xml_reader::{DiConfig, Plugin};
+    use di_xml_reader::{apply_module_config_on_primary, merge_configs, DiConfig, Plugin};
     use php_extractor::types::{ClassInfo, ClassKind, MethodSignature};
     use std::path::PathBuf;
 
@@ -573,8 +607,9 @@ mod tests {
         Plugin {
             name: name.to_string(),
             type_name: instance.to_string(),
-            sort_order,
-            disabled,
+            sort_order: Some(sort_order),
+            disabled: Some(disabled),
+            disabled_after_type: false,
         }
     }
 
@@ -604,7 +639,7 @@ mod tests {
             .and_then(|v| v.as_ref())
             .unwrap();
         assert_eq!(inherited.len(), 1);
-        assert!(inherited[0].disabled);
+        assert!(inherited[0].is_disabled());
         assert!(compiled.processed.is_empty());
     }
 
@@ -709,5 +744,156 @@ mod tests {
         assert!(out.contains("  2 => "));
         assert!(out.contains("'Foo\\\\Target_run___self'"));
         assert!(out.ends_with(");\n"));
+    }
+
+    // Magento reads one scope at a time. Files inside a scope merge attribute by attribute
+    // through the DOM, then `PluginListGenerator::merge()` lays each scope over the previous
+    // one with array_replace_recursive.
+    fn scope_config(files: &[&str]) -> DiConfig {
+        merge_configs(
+            files
+                .iter()
+                .map(|xml| {
+                    di_xml_reader::parser::parse_di_xml_bytes(
+                        format!("<config>{xml}</config>").as_bytes(),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+    }
+
+    fn scoped_config(scopes: &[&[&str]]) -> DiConfig {
+        scopes.iter().fold(DiConfig::default(), |merged, files| {
+            apply_module_config_on_primary(merged, scope_config(files))
+        })
+    }
+
+    fn override_fixture_classes() -> FxHashMap<String, ClassInfo> {
+        let mut class_map = FxHashMap::default();
+        for (fqcn, extends, methods) in [
+            ("Foo\\Parent", None, vec!["run"]),
+            ("Foo\\Child", Some("Foo\\Parent"), vec!["run"]),
+            ("Foo\\Plugin", None, vec!["beforeRun"]),
+        ] {
+            class_map.insert(fqcn.to_string(), class_info(fqcn, extends, &[], &methods));
+        }
+        class_map
+    }
+
+    const DECLARE_ON_PARENT: &str =
+        r#"<type name="Foo\Parent"><plugin name="x" type="Foo\Plugin" sortOrder="10"/></type>"#;
+
+    fn compile_overrides(scopes: &[&[&str]]) -> PluginListMetadata {
+        let class_map = override_fixture_classes();
+        let classes: Vec<String> = class_map.keys().cloned().collect();
+        compile_plugin_list(&scoped_config(scopes), &class_map, &classes, true)
+    }
+
+    fn inherited_plugin<'a>(
+        compiled: &'a PluginListMetadata,
+        owner: &str,
+        name: &str,
+    ) -> Option<&'a PluginConfig> {
+        compiled
+            .inherited
+            .get(owner)
+            .and_then(|plugins| plugins.as_ref())
+            .and_then(|plugins| plugins.iter().find(|plugin| plugin.name == name))
+    }
+
+    #[test]
+    fn area_disable_without_type_turns_the_plugin_off_in_that_area() {
+        let area = r#"<type name="Foo\Parent"><plugin name="x" disabled="true"/></type>"#;
+        let compiled = compile_overrides(&[&[DECLARE_ON_PARENT], &[area]]);
+
+        assert!(!compiled.processed.contains_key("Foo\\Parent_run___self"));
+        let plugin = inherited_plugin(&compiled, "Foo\\Parent", "x").unwrap();
+        assert_eq!(plugin.instance, "Foo\\Plugin");
+    }
+
+    #[test]
+    fn child_disable_without_type_turns_off_a_plugin_declared_on_the_parent() {
+        let child = r#"<type name="Foo\Child"><plugin name="x" disabled="true"/></type>"#;
+        let compiled = compile_overrides(&[&[DECLARE_ON_PARENT, child]]);
+
+        assert!(compiled.processed.contains_key("Foo\\Parent_run___self"));
+        assert!(!compiled.processed.contains_key("Foo\\Child_run___self"));
+        let plugin = inherited_plugin(&compiled, "Foo\\Child", "x").unwrap();
+        assert_eq!(plugin.instance, "Foo\\Plugin");
+    }
+
+    #[test]
+    fn child_sort_order_override_keeps_the_instance_from_the_parent() {
+        let child = r#"<type name="Foo\Child"><plugin name="x" sortOrder="5"/></type>"#;
+        let compiled = compile_overrides(&[&[DECLARE_ON_PARENT, child]]);
+
+        assert!(compiled.processed.contains_key("Foo\\Child_run___self"));
+        let plugin = inherited_plugin(&compiled, "Foo\\Child", "x").unwrap();
+        assert_eq!(plugin.instance, "Foo\\Plugin");
+        assert_eq!(plugin.sort_order, 5);
+    }
+
+    #[test]
+    fn override_in_a_later_scope_without_sort_order_resets_it_to_zero() {
+        let area = r#"<type name="Foo\Parent"><plugin name="x" disabled="true"/></type>"#;
+        let compiled = compile_overrides(&[&[DECLARE_ON_PARENT], &[area]]);
+
+        let plugin = inherited_plugin(&compiled, "Foo\\Parent", "x").unwrap();
+        assert_eq!(plugin.sort_order, 0);
+    }
+
+    #[test]
+    fn override_in_the_same_scope_without_sort_order_keeps_it() {
+        let later = r#"<type name="Foo\Parent"><plugin name="x" disabled="true"/></type>"#;
+        let compiled = compile_overrides(&[&[DECLARE_ON_PARENT, later]]);
+
+        let plugin = inherited_plugin(&compiled, "Foo\\Parent", "x").unwrap();
+        assert_eq!(plugin.sort_order, 10);
+    }
+
+    #[test]
+    fn later_explicit_enable_wins_over_an_earlier_disable() {
+        let off = r#"<type name="Foo\Parent"><plugin name="x" disabled="true"/></type>"#;
+        let on = r#"<type name="Foo\Parent"><plugin name="x" disabled="false"/></type>"#;
+
+        let same_scope = compile_overrides(&[&[DECLARE_ON_PARENT, off, on]]);
+        assert!(same_scope.processed.contains_key("Foo\\Parent_run___self"));
+
+        let next_scope = compile_overrides(&[&[DECLARE_ON_PARENT, off], &[on]]);
+        assert!(next_scope.processed.contains_key("Foo\\Parent_run___self"));
+    }
+
+    #[test]
+    fn override_of_a_plugin_nobody_declares_never_reaches_the_inherited_list() {
+        let orphan = r#"<type name="Foo\Child"><plugin name="y" disabled="true"/></type>"#;
+        let compiled = compile_overrides(&[&[orphan]]);
+
+        assert!(compiled.plugin_data.contains_key("Foo\\Child"));
+        assert!(inherited_plugin(&compiled, "Foo\\Child", "y").is_none());
+    }
+
+    #[test]
+    fn plugin_rows_are_written_with_the_attributes_magento_writes() {
+        let compiled = compile_overrides(&[
+            &[
+                r#"<type name="Foo\Parent"><plugin name="on" type="Foo\Plugin" disabled="false"/></type>"#,
+                r#"<type name="Foo\Child"><plugin name="ref" disabled="true"/></type>"#,
+                DECLARE_ON_PARENT,
+            ],
+            &[r#"<type name="Foo\Parent"><plugin name="x" disabled="true"/></type>"#],
+        ]);
+        let php = serialize_plugin_list_php(&compiled);
+        let section_0 = &php[..php.find("  1 => ").unwrap()];
+
+        assert!(section_0.contains(
+            "'on' => \n      array (\n        'sortOrder' => 0,\n        'disabled' => false,\n        'instance' => 'Foo\\\\Plugin',\n"
+        ));
+        assert!(section_0.contains(
+            "'ref' => \n      array (\n        'sortOrder' => 0,\n        'disabled' => true,\n      ),\n"
+        ));
+        assert!(section_0.contains(
+            "'x' => \n      array (\n        'sortOrder' => 0,\n        'instance' => 'Foo\\\\Plugin',\n        'disabled' => true,\n"
+        ));
     }
 }

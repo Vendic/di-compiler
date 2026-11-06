@@ -28,7 +28,8 @@ pub fn detect_interceptors(
     let mut directly_intercepted: FxHashSet<String> = FxHashSet::default();
 
     for (owner_name, plugins) in &di_config.plugins {
-        let active: Vec<&di_xml_reader::Plugin> = plugins.iter().filter(|p| !p.disabled).collect();
+        let active: Vec<&di_xml_reader::Plugin> =
+            plugins.iter().filter(|p| p.is_active()).collect();
         if active.is_empty() {
             continue;
         }
@@ -101,7 +102,7 @@ pub fn detect_interceptors(
             .map(|p| PluginRef {
                 name: p.name.clone(),
                 type_name: p.type_name.clone(),
-                sort_order: p.sort_order,
+                sort_order: p.effective_sort_order(),
             })
             .collect();
         plugin_refs.sort_by_key(|p| p.sort_order);
@@ -293,11 +294,11 @@ fn derive_intercepted_methods_from_ancestor_plugins(
         if let Some(plugins) = di_config.plugins.get(&current) {
             let plugin_refs: Vec<PluginRef> = plugins
                 .iter()
-                .filter(|p| !p.disabled)
+                .filter(|p| p.is_active())
                 .map(|p| PluginRef {
                     name: p.name.clone(),
                     type_name: p.type_name.clone(),
-                    sort_order: p.sort_order,
+                    sort_order: p.effective_sort_order(),
                 })
                 .collect();
             if !plugin_refs.is_empty() {
@@ -433,8 +434,9 @@ mod tests {
         Plugin {
             name: name.to_string(),
             type_name: type_name.to_string(),
-            sort_order,
-            disabled,
+            sort_order: Some(sort_order),
+            disabled: Some(disabled),
+            disabled_after_type: false,
         }
     }
 
