@@ -63,6 +63,72 @@ if (class_exists($errorHandler)) {
 }
 "#;
 
+/// `bin/magento` creates the real ObjectManager before it loads any class, so a class file can use
+/// `ObjectManager::getInstance()` while it loads. Starting one takes seconds and few stores need
+/// it, so this one starts the store's real one on first use. Needs `$root`. What it would write
+/// goes to a temporary folder. A failure to start, or in the call itself, stays an error of the
+/// class that asked, as it is in Magento.
+pub(crate) const OBJECT_MANAGER_PHP: &str = r#"
+if (class_exists('Magento\\Framework\\App\\ObjectManager') && class_exists('Magento\\Framework\\App\\Bootstrap')) {
+    \Magento\Framework\App\ObjectManager::setInstance(new class($root) implements \Magento\Framework\ObjectManagerInterface {
+        public function __construct(private string $root)
+        {
+        }
+
+        private function real(): \Magento\Framework\ObjectManagerInterface
+        {
+            $level = ob_get_level();
+            ob_start();
+            try {
+                if (is_file($this->root . '/app/bootstrap.php')) {
+                    require_once $this->root . '/app/bootstrap.php';
+                }
+                $folder = sys_get_temp_dir() . '/fast-di-compile-' . uniqid((string) getmypid(), true);
+                register_shutdown_function(static function () use ($folder): void {
+                    if (!is_dir($folder)) {
+                        return;
+                    }
+                    $items = new RecursiveIteratorIterator(
+                        new RecursiveDirectoryIterator($folder, FilesystemIterator::SKIP_DOTS),
+                        RecursiveIteratorIterator::CHILD_FIRST
+                    );
+                    foreach ($items as $item) {
+                        $item->isDir() && !$item->isLink() ? @rmdir($item->getPathname()) : @unlink($item->getPathname());
+                    }
+                    @rmdir($folder);
+                });
+                $params = $_SERVER;
+                $params['MAGE_REQUIRE_MAINTENANCE'] = null;
+                $params['MAGE_DIRS'] = [];
+                foreach (['var', 'cache', 'log', 'tmp', 'session', 'generated', 'code', 'metadata'] as $code) {
+                    $params['MAGE_DIRS'][$code] = ['path' => $folder . '/' . $code];
+                }
+                return \Magento\Framework\App\Bootstrap::create($this->root, $params)->getObjectManager();
+            } finally {
+                while (ob_get_level() > $level) {
+                    ob_end_clean();
+                }
+            }
+        }
+
+        public function create($type, array $arguments = [])
+        {
+            return $this->real()->create($type, $arguments);
+        }
+
+        public function get($type)
+        {
+            return $this->real()->get($type);
+        }
+
+        public function configure(array $configuration)
+        {
+            $this->real()->configure($configuration);
+        }
+    });
+}
+"#;
+
 const CLASS_CHECK_HEAD_PHP: &str = r#"
 ini_set('display_errors', '0');
 [, $mode, $root, $generated, $validate] = $argv;
@@ -308,7 +374,9 @@ fn run_php(
 ) -> Result<Run, String> {
     let spawned = Command::new(php_bin)
         .args(["-d", "display_errors=0", "-r"])
-        .arg(format!("{CLASS_CHECK_HEAD_PHP}{BOOT_PHP}{CLASS_CHECK_PHP}"))
+        .arg(format!(
+            "{CLASS_CHECK_HEAD_PHP}{BOOT_PHP}{OBJECT_MANAGER_PHP}{CLASS_CHECK_PHP}"
+        ))
         .args(["--", mode])
         .arg(root)
         .arg(code_root)
