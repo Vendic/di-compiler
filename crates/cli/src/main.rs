@@ -284,6 +284,12 @@ function plugin_class_exists(string $class) {
         return $e->getMessage();
     }
 }
+// `get_class_methods()` in `Definition\\Runtime::getMethodList()` takes any class-like name.
+function class_like_exists(string $class) {
+    $exists = plugin_class_exists($class);
+    if ($exists === false) return interface_exists($class) || trait_exists($class);
+    return $exists;
+}
 // What `Reader::generateCachePerScope()` needs to know about the target of a preference.
 function preference_target(string $class) {
     $exists = plugin_class_exists($class);
@@ -325,6 +331,7 @@ while (($line = fgets($stdin)) !== false) {
             'ctor'    => reflect_ctor($class),
             'plugin_class_exists' => plugin_class_exists($class),
             'preference_target' => preference_target($class),
+            'class_like_exists' => class_like_exists($class),
             default   => null,
         };
         fwrite(STDOUT, json_encode($result) . "\n");
@@ -1745,6 +1752,7 @@ fn main() {
             "Generating plugin-list metadata",
         );
         let unconfirmed_plugin_classes = Mutex::new(std::collections::BTreeSet::new());
+        let disabled_plugin_classes = Mutex::new(std::collections::BTreeSet::new());
         plugin_scopes.par_iter().for_each(|&scope| {
             if let Some(scope_di_config) = area_di_configs.get(scope) {
                 // A scope with no di.xml of its own has the global config here, but loads
@@ -1768,6 +1776,15 @@ fn main() {
                     .lock()
                     .unwrap()
                     .extend(metadata.unconfirmed_plugin_classes.iter().cloned());
+                disabled_plugin_classes.lock().unwrap().extend(
+                    disabled_plugin_classes_of_intercepted_types(
+                        &metadata,
+                        &class_map,
+                        &plugin_list_class_map,
+                        &metadata_base_di_config,
+                        &magento_root.join("setup"),
+                    ),
+                );
                 let content = serialize_plugin_list_php(&metadata);
                 let cache_id = plugin_list_cache_id(scope);
                 let path = metadata_root.join(format!("{}.php", cache_id));
@@ -1782,6 +1799,7 @@ fn main() {
         });
         pb_plugins.finish_with_message("done");
         stop_on_missing_plugin_classes(&unconfirmed_plugin_classes.into_inner().unwrap());
+        stop_on_missing_disabled_plugin_classes(&disabled_plugin_classes.into_inner().unwrap());
         log_phase_elapsed("Phase 7 plugin-list loop", t_plugin_list);
 
         // App action list metadata.
@@ -1881,6 +1899,90 @@ fn main() {
     let _ = std::fs::remove_file(&worker_script_path);
 }
 
+/// `InterceptionConfigurationBuilder::getInterceptedMethods()` calls `get_class_methods()` on
+/// each plugin of the inherited list of a scanned concrete class. `PluginListGenerator` keeps
+/// disabled plugins in that list, so a disabled plugin whose class is gone is a TypeError.
+/// A row without a class is not in the list. Returns `(plugin class, owner)`.
+fn disabled_plugin_classes_of_intercepted_types(
+    metadata: &code_generator::PluginListMetadata,
+    class_map: &FxHashMap<String, ClassInfo>,
+    lookup: &FxHashMap<String, ClassInfo>,
+    om_config: &DiConfig,
+    setup_root: &Path,
+) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for (owner, plugins) in &metadata.inherited {
+        let Some(plugins) = plugins else {
+            continue;
+        };
+        let intercepted = class_map.get(owner.as_str()).is_some_and(|info| {
+            info.kind == ClassKind::Class
+                && !info.is_abstract
+                && !info.path.starts_with(setup_root)
+                && !owner.ends_with("\\Interceptor")
+                && !self_and_ancestors(owner, lookup)
+                    .contains("Magento\\Framework\\ObjectManager\\NoninterceptableInterface")
+        });
+        if !intercepted {
+            continue;
+        }
+        for plugin in plugins {
+            if plugin.disabled == Some(true) && !plugin.instance.is_empty() {
+                let class = om_config.get_instance_type(&plugin.instance);
+                if !class_map.contains_key(class.trim_start_matches('\\')) {
+                    found.push((class.trim_start_matches('\\').to_string(), owner.clone()));
+                }
+            }
+        }
+    }
+    found
+}
+
+fn stop_on_missing_disabled_plugin_classes(classes: &BTreeSet<(String, String)>) {
+    for (class, owner) in classes {
+        let answer = PHP_WORKER_POOL
+            .get()
+            .and_then(|pool| pool.request(&format!("class_like_exists:{class}")))
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim()).ok());
+        let message = match answer {
+            Some(serde_json::Value::Bool(true)) => continue,
+            Some(serde_json::Value::Bool(false)) => {
+                format!("Plugin class {class} doesn't exist (disabled plugin on {owner})")
+            }
+            Some(serde_json::Value::String(message)) => {
+                format!("Plugin class {class} cannot load (disabled plugin on {owner}): {message}")
+            }
+            // No PHP answer proves nothing, and a false stop blocks a working store.
+            _ => {
+                log::warn!("Could not check plugin class {class} in PHP");
+                continue;
+            }
+        };
+        eprintln!("error: {message}");
+        std::process::exit(1);
+    }
+}
+
+/// The class and everything `class_parents()` and `class_implements()` give for it, as far as the
+/// lookup knows. Stops at a class named Interceptor, as `Config::_inheritInterception()` does.
+fn self_and_ancestors<'a>(
+    name: &'a str,
+    lookup: &'a FxHashMap<String, ClassInfo>,
+) -> FxHashSet<&'a str> {
+    let mut seen: FxHashSet<&str> = FxHashSet::default();
+    let mut stack: Vec<&str> = vec![name];
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name) || name.rsplit('\\').next() == Some("Interceptor") {
+            continue;
+        }
+        if let Some(info) = lookup.get(name) {
+            stack.extend(info.extends.iter().map(|n| n.trim_start_matches('\\')));
+            stack.extend(info.implements.iter().map(|n| n.trim_start_matches('\\')));
+        }
+    }
+    seen
+}
+
 /// `InterceptionConfigurationBuilder::getInterceptedClasses()` picks every scanned concrete class
 /// with `Config::hasPlugins()` true, and the generated interceptor is loaded. For a final class
 /// that is a fatal error. `hasPlugins()` also counts a disabled plugin, and plugins of parents and
@@ -1901,25 +2003,10 @@ fn final_class_with_plugins(
             {
                 return false;
             }
-            let mut seen: FxHashSet<&str> = FxHashSet::default();
-            let mut stack: Vec<&str> = vec![fqcn.as_str()];
-            let mut plugins = false;
-            while let Some(name) = stack.pop() {
-                if !seen.insert(name) {
-                    continue;
-                }
-                plugins |= has_plugins(name);
-                // `Config::_inheritInterception()` does not look past a class named Interceptor.
-                if name.rsplit('\\').next() == Some("Interceptor") {
-                    continue;
-                }
-                if let Some(parent) = lookup.get(name) {
-                    stack.extend(parent.extends.iter().map(|n| n.trim_start_matches('\\')));
-                    stack.extend(parent.implements.iter().map(|n| n.trim_start_matches('\\')));
-                }
-            }
-            plugins
-                && !seen.contains("Magento\\Framework\\ObjectManager\\NoninterceptableInterface")
+            let ancestors = self_and_ancestors(fqcn, lookup);
+            ancestors.iter().any(|name| has_plugins(name))
+                && !ancestors
+                    .contains("Magento\\Framework\\ObjectManager\\NoninterceptableInterface")
         })
         .map(|(fqcn, _)| fqcn)
         .collect();
