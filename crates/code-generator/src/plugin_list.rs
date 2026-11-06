@@ -3,8 +3,8 @@
 //! Generates Magento-style compiled plugin list metadata files:
 //! `primary|global|...|plugin-list.php`
 
+use indexmap::IndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::BTreeMap;
 
 use di_xml_reader::{DiConfig, Plugin as DiPlugin};
 use php_extractor::types::ClassKind;
@@ -85,43 +85,64 @@ impl ProcessedMethod {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PluginListMetadata {
-    pub plugin_data: BTreeMap<String, Vec<PluginConfig>>,
-    pub inherited: BTreeMap<String, Option<Vec<PluginConfig>>>,
-    pub processed: BTreeMap<String, ProcessedMethod>,
+    pub plugin_data: IndexMap<String, Vec<PluginConfig>>,
+    pub inherited: IndexMap<String, Option<Vec<PluginConfig>>>,
+    pub processed: IndexMap<String, ProcessedMethod>,
 }
 
-/// Build the in-memory plugin list structures:
+/// Build the in-memory plugin list structures for one config:
 /// section 0 => pluginData, section 1 => inherited, section 2 => processed.
 ///
-/// `include_virtual_types`: when `false`, skips the virtual-type inherit pass
-/// (correct for non-global scopes where virtual types are not applicable).
-/// Avoids cloning + clearing the full DiConfig in the caller.
+/// `include_virtual_types`: visit every virtual type in the config first, in name order.
 pub fn compile_plugin_list(
     di_config: &DiConfig,
     class_map: &FxHashMap<String, ClassInfo>,
     class_definitions: &[String],
     include_virtual_types: bool,
 ) -> PluginListMetadata {
-    let plugin_data = collect_plugin_data(di_config);
-    let mut inherited: FxHashMap<String, Option<Vec<PluginConfig>>> = FxHashMap::default();
-    let mut processed: FxHashMap<String, ProcessedMethod> = FxHashMap::default();
-    let mut plugin_methods_cache: FxHashMap<String, FxHashMap<String, u8>> = FxHashMap::default();
-
-    // 1) Virtual types from merged scope config (global scope only).
+    let mut virtual_types: Vec<String> = Vec::new();
     if include_virtual_types {
-        let mut virtual_types: Vec<&String> = di_config.virtual_types.keys().collect();
+        virtual_types.extend(di_config.virtual_types.keys().cloned());
         virtual_types.sort();
-        for vt in virtual_types {
-            inherit_plugins(
-                vt,
-                &plugin_data,
-                di_config,
-                class_map,
-                &mut inherited,
-                &mut processed,
-                &mut plugin_methods_cache,
-            );
-        }
+    }
+    compile_scope_plugin_list(
+        di_config,
+        di_config,
+        class_map,
+        class_definitions,
+        &virtual_types,
+    )
+}
+
+/// Build the plugin list of one scope in the order of `PluginListGenerator::write()`:
+/// the scope's virtual types, the plugin owners, then the class definitions. The first visit
+/// of a type fixes its position and what it hands to its children, see `inherit_plugins`.
+///
+/// `scope_config` holds the plugins of this scope. `om_config` resolves virtual types and is
+/// the global config in every scope, because Magento's `omConfig` does not load area files.
+pub fn compile_scope_plugin_list(
+    scope_config: &DiConfig,
+    om_config: &DiConfig,
+    class_map: &FxHashMap<String, ClassInfo>,
+    class_definitions: &[String],
+    scope_virtual_types: &[String],
+) -> PluginListMetadata {
+    let plugin_data = collect_plugin_data(scope_config);
+    let mut inherited: IndexMap<String, Option<Vec<PluginConfig>>> = IndexMap::new();
+    let mut processed: IndexMap<String, ProcessedMethod> = IndexMap::new();
+    let mut plugin_methods_cache: FxHashMap<String, IndexMap<String, u8>> = FxHashMap::default();
+
+    // 1) Virtual types the scope declares.
+    for vt in scope_virtual_types {
+        inherit_plugins(
+            vt,
+            &plugin_data,
+            om_config,
+            class_map,
+            &mut inherited,
+            &mut processed,
+            &mut plugin_methods_cache,
+        );
     }
 
     // 2) Explicit plugin owners.
@@ -129,7 +150,7 @@ pub fn compile_plugin_list(
         inherit_plugins(
             owner,
             &plugin_data,
-            di_config,
+            om_config,
             class_map,
             &mut inherited,
             &mut processed,
@@ -154,7 +175,7 @@ pub fn compile_plugin_list(
         inherit_plugins(
             &class_name,
             &plugin_data,
-            di_config,
+            om_config,
             class_map,
             &mut inherited,
             &mut processed,
@@ -162,20 +183,10 @@ pub fn compile_plugin_list(
         );
     }
 
-    let mut inherited_sorted = BTreeMap::new();
-    for (k, v) in inherited {
-        inherited_sorted.insert(k, v);
-    }
-
-    let mut processed_sorted = BTreeMap::new();
-    for (k, v) in processed {
-        processed_sorted.insert(k, v);
-    }
-
     PluginListMetadata {
         plugin_data,
-        inherited: inherited_sorted,
-        processed: processed_sorted,
+        inherited,
+        processed,
     }
 }
 
@@ -271,12 +282,16 @@ pub fn serialize_plugin_list_php(metadata: &PluginListMetadata) -> String {
     out
 }
 
-fn collect_plugin_data(di_config: &DiConfig) -> BTreeMap<String, Vec<PluginConfig>> {
-    let mut out = BTreeMap::new();
-    let mut owners: Vec<&String> = di_config.plugins.keys().collect();
-    owners.sort();
-    for owner in owners {
-        let owner_name = normalize(owner);
+fn collect_plugin_data(di_config: &DiConfig) -> IndexMap<String, Vec<PluginConfig>> {
+    let mut unordered: Vec<&String> = di_config
+        .plugins
+        .keys()
+        .filter(|owner| !di_config.plugin_owners.contains(*owner))
+        .collect();
+    unordered.sort();
+
+    let mut out = IndexMap::new();
+    for owner in di_config.plugin_owners.iter().chain(unordered) {
         let Some(source_plugins) = di_config.plugins.get(owner.as_str()) else {
             continue;
         };
@@ -287,7 +302,7 @@ fn collect_plugin_data(di_config: &DiConfig) -> BTreeMap<String, Vec<PluginConfi
         for plugin in source_plugins {
             list.push(from_di_plugin(plugin));
         }
-        out.insert(owner_name, list);
+        out.insert(normalize(owner), list);
     }
     out
 }
@@ -295,12 +310,12 @@ fn collect_plugin_data(di_config: &DiConfig) -> BTreeMap<String, Vec<PluginConfi
 #[allow(clippy::too_many_arguments)]
 fn inherit_plugins(
     type_name: &str,
-    plugin_data: &BTreeMap<String, Vec<PluginConfig>>,
+    plugin_data: &IndexMap<String, Vec<PluginConfig>>,
     di_config: &DiConfig,
     class_map: &FxHashMap<String, ClassInfo>,
-    inherited: &mut FxHashMap<String, Option<Vec<PluginConfig>>>,
-    processed: &mut FxHashMap<String, ProcessedMethod>,
-    plugin_methods_cache: &mut FxHashMap<String, FxHashMap<String, u8>>,
+    inherited: &mut IndexMap<String, Option<Vec<PluginConfig>>>,
+    processed: &mut IndexMap<String, ProcessedMethod>,
+    plugin_methods_cache: &mut FxHashMap<String, IndexMap<String, u8>>,
 ) -> Option<Vec<PluginConfig>> {
     let type_name = normalize(type_name);
     if let Some(existing) = inherited.get(&type_name) {
@@ -351,6 +366,7 @@ fn inherit_plugins(
     }
 
     inherited.insert(type_name.clone(), None);
+    let mut first_visit_result = None;
 
     if !plugins.is_empty() {
         let mut sorted_plugins: Vec<PluginConfig> = plugins
@@ -372,14 +388,7 @@ fn inherit_plugins(
             }
             let plugin_type = normalize(&di_config.get_instance_type(&plugin.instance));
             let method_types = plugin_method_types(&plugin_type, class_map, plugin_methods_cache);
-            if method_types.is_empty() {
-                continue;
-            }
-
-            let mut method_names: Vec<&String> = method_types.keys().collect();
-            method_names.sort();
-            for plugin_method in method_names {
-                let listener_flags = method_types[plugin_method];
+            for (plugin_method, &listener_flags) in &method_types {
                 let current = last_per_method
                     .get(plugin_method)
                     .map(|s| s.as_str())
@@ -399,30 +408,104 @@ fn inherit_plugins(
                 }
             }
         }
+
+        // `inheritPlugins()` unsets disabled plugins from its local list before it returns,
+        // while `$inherited` keeps them. So the first visit hands children a list without
+        // them, and every later visit a list with them.
+        sorted_plugins.retain(|plugin| !plugin.is_disabled());
+        first_visit_result = Some(sorted_plugins);
     }
 
-    inherited.get(&type_name).cloned().unwrap_or(None)
+    first_visit_result
 }
 
+/// `ObjectManager\\Relations\\Runtime::getParents()`: `ClassReader::getParents()` for a class,
+/// nothing for an interface or trait because `class_exists()` is false for those.
 fn get_parents(type_name: &str, class_map: &FxHashMap<String, ClassInfo>) -> Vec<String> {
     let Some(info) = class_map.get(type_name) else {
         return Vec::new();
     };
+    if matches!(info.kind, ClassKind::Interface | ClassKind::Trait) {
+        return Vec::new();
+    }
 
-    let mut relations = Vec::new();
-    if let Some(parent) = &info.extends {
-        let parent = normalize(parent);
-        if !parent.is_empty() {
-            relations.push(parent);
-        }
-    }
-    for interface in &info.implements {
-        let interface = normalize(interface);
-        if !interface.is_empty() {
-            relations.push(interface);
-        }
-    }
+    let interfaces = class_implements(type_name, class_map);
+    let parent = info
+        .extends
+        .as_deref()
+        .map(normalize)
+        .filter(|parent| !parent.is_empty());
+    let Some(parent) = parent else {
+        return interfaces;
+    };
+    let parent_interfaces = class_implements(&parent, class_map);
+    let mut relations = vec![parent];
+    relations.extend(
+        interfaces
+            .into_iter()
+            .filter(|interface| !contains_name(&parent_interfaces, interface)),
+    );
     relations
+}
+
+/// PHP's `class_implements()`, in the order of `zend_do_implement_interfaces()`: the parent's
+/// interfaces, the declared ones (a class with `__toString` declares `Stringable` last), then
+/// for each declared one the interfaces it has, last one first.
+fn class_implements(type_name: &str, class_map: &FxHashMap<String, ClassInfo>) -> Vec<String> {
+    let Some(info) = class_map.get(type_name) else {
+        return builtin_interface_parents(type_name)
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+    };
+    let is_interface = matches!(info.kind, ClassKind::Interface);
+
+    let mut interfaces = Vec::new();
+    let mut declared: Vec<String> = Vec::new();
+    if let Some(extends) = info.extends.as_deref().map(normalize) {
+        if is_interface {
+            declared.push(extends);
+        } else {
+            interfaces = class_implements(&extends, class_map);
+        }
+    }
+    declared.extend(info.implements.iter().map(|name| normalize(name)));
+    let declares_to_string = info
+        .public_methods
+        .iter()
+        .any(|method| method.name.eq_ignore_ascii_case("__toString"));
+    if declares_to_string && !matches!(info.kind, ClassKind::Trait) {
+        declared.push("Stringable".to_string());
+    }
+
+    for name in &declared {
+        if !name.is_empty() && !contains_name(&interfaces, name) {
+            interfaces.push(name.clone());
+        }
+    }
+    for name in &declared {
+        for extended in class_implements(name, class_map).into_iter().rev() {
+            if !contains_name(&interfaces, &extended) {
+                interfaces.push(extended);
+            }
+        }
+    }
+    interfaces
+}
+
+/// `class_implements()` of PHP's own interfaces, which no scan of the store can find.
+fn builtin_interface_parents(type_name: &str) -> &'static [&'static str] {
+    match type_name {
+        "Iterator" | "IteratorAggregate" => &["Traversable"],
+        "OuterIterator" | "RecursiveIterator" | "SeekableIterator" => &["Iterator", "Traversable"],
+        "Throwable" => &["Stringable"],
+        "BackedEnum" => &["UnitEnum"],
+        _ => &[],
+    }
+}
+
+fn contains_name(names: &[String], name: &str) -> bool {
+    names.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
 
 fn merge_plugin_lists(dst: &mut Vec<PluginConfig>, src: &[PluginConfig]) {
@@ -448,14 +531,14 @@ fn from_di_plugin(plugin: &DiPlugin) -> PluginConfig {
 fn plugin_method_types(
     plugin_type: &str,
     class_map: &FxHashMap<String, ClassInfo>,
-    cache: &mut FxHashMap<String, FxHashMap<String, u8>>,
-) -> FxHashMap<String, u8> {
+    cache: &mut FxHashMap<String, IndexMap<String, u8>>,
+) -> IndexMap<String, u8> {
     if let Some(cached) = cache.get(plugin_type) {
         return cached.clone();
     }
 
     let methods = collect_public_methods_with_inheritance(plugin_type, class_map);
-    let mut result: FxHashMap<String, u8> = FxHashMap::default();
+    let mut result: IndexMap<String, u8> = IndexMap::new();
     for method in methods {
         if let Some((intercepted, listener)) = parse_plugin_listener(&method) {
             result
@@ -817,6 +900,207 @@ mod tests {
         assert!(!compiled.processed.contains_key("Foo\\Child_run___self"));
         let plugin = inherited_plugin(&compiled, "Foo\\Child", "x").unwrap();
         assert_eq!(plugin.instance, "Foo\\Plugin");
+    }
+
+    fn section_keys<V>(section: &IndexMap<String, V>) -> Vec<&str> {
+        section.keys().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn sections_follow_the_visit_order_of_the_scope() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "Plugin\\A".to_string(),
+            class_info(
+                "Plugin\\A",
+                None,
+                &[],
+                &["beforeZed", "afterRun", "beforeAlpha"],
+            ),
+        );
+        class_map.insert(
+            "Zed\\Child".to_string(),
+            class_info("Zed\\Child", Some("Alpha\\Parent"), &[], &[]),
+        );
+        let mut di = DiConfig::default();
+        di.plugin_owners.insert("Zed\\Child".to_string());
+        di.plugin_owners.insert("Middle".to_string());
+        for owner in ["Zed\\Child", "Middle"] {
+            di.plugins
+                .insert(owner.to_string(), vec![plugin("p", "Plugin\\A", 0, false)]);
+        }
+
+        let metadata =
+            compile_scope_plugin_list(&di, &di, &class_map, &[], &["Virtual".to_string()]);
+
+        assert_eq!(
+            section_keys(&metadata.plugin_data),
+            ["Zed\\Child", "Middle"]
+        );
+        // A parent gets its place before its child, and a type with no plugins has one too.
+        assert_eq!(
+            section_keys(&metadata.inherited),
+            ["Virtual", "Alpha\\Parent", "Zed\\Child", "Middle"]
+        );
+        assert_eq!(
+            section_keys(&metadata.processed),
+            [
+                "Zed\\Child_zed___self",
+                "Zed\\Child_run___self",
+                "Zed\\Child_alpha___self",
+                "Middle_zed___self",
+                "Middle_run___self",
+                "Middle_alpha___self",
+            ]
+        );
+    }
+
+    #[test]
+    fn first_visit_of_a_type_hands_children_a_list_without_disabled_plugins() {
+        let mut class_map = FxHashMap::default();
+        for child in ["Early", "Late"] {
+            class_map.insert(
+                child.to_string(),
+                class_info(child, Some("Parent"), &[], &[]),
+            );
+        }
+        let mut di = DiConfig::default();
+        di.plugin_owners.insert("Early".to_string());
+        di.plugin_owners.insert("Late".to_string());
+        di.plugin_owners.insert("Parent".to_string());
+        di.plugins
+            .insert("Parent".to_string(), vec![plugin("off", "P", 0, true)]);
+        for child in ["Early", "Late"] {
+            di.plugins
+                .insert(child.to_string(), vec![plugin("own", "P", 0, false)]);
+        }
+
+        let metadata = compile_scope_plugin_list(&di, &di, &class_map, &[], &[]);
+
+        let names = |owner: &str| -> Vec<String> {
+            metadata.inherited[owner]
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|p| p.name.clone())
+                .collect()
+        };
+        // Early visits Parent for the first time. Late gets the cached list.
+        assert_eq!(names("Early"), ["own"]);
+        assert_eq!(names("Late"), ["off", "own"]);
+        assert_eq!(names("Parent"), ["off"]);
+    }
+
+    #[test]
+    fn an_interface_has_no_parents_of_its_own() {
+        let mut class_map = FxHashMap::default();
+        let mut child = class_info("ChildInterface", Some("ParentInterface"), &[], &[]);
+        child.kind = ClassKind::Interface;
+        class_map.insert("ChildInterface".to_string(), child);
+        let mut parent = class_info("ParentInterface", None, &[], &[]);
+        parent.kind = ClassKind::Interface;
+        class_map.insert("ParentInterface".to_string(), parent);
+        let mut di = DiConfig::default();
+        di.plugins.insert(
+            "ParentInterface".to_string(),
+            vec![plugin("p", "P", 0, false)],
+        );
+        di.plugin_owners.insert("ChildInterface".to_string());
+        di.plugins.insert(
+            "ChildInterface".to_string(),
+            vec![plugin("c", "P", 0, false)],
+        );
+
+        let metadata = compile_scope_plugin_list(&di, &di, &class_map, &[], &[]);
+
+        let child_list = metadata.inherited["ChildInterface"].as_ref().unwrap();
+        assert_eq!(child_list.len(), 1);
+        assert_eq!(child_list[0].name, "c");
+    }
+
+    #[test]
+    fn parents_follow_class_implements_order() {
+        let mut class_map = FxHashMap::default();
+        let interface = |name: &str, extends: Option<&str>| {
+            let mut info = class_info(name, extends, &[], &[]);
+            info.kind = ClassKind::Interface;
+            info
+        };
+        class_map.insert("Top".to_string(), interface("Top", None));
+        class_map.insert("Mid".to_string(), interface("Mid", Some("Top")));
+        class_map.insert("Other".to_string(), interface("Other", None));
+        class_map.insert("FromBase".to_string(), interface("FromBase", None));
+        class_map.insert(
+            "Base".to_string(),
+            class_info("Base", None, &["FromBase"], &[]),
+        );
+        class_map.insert(
+            "Target".to_string(),
+            class_info("Target", Some("Base"), &["Mid", "Other"], &["__toString"]),
+        );
+
+        assert_eq!(
+            get_parents("Target", &class_map),
+            ["Base", "Mid", "Other", "Stringable", "Top"]
+        );
+        assert_eq!(get_parents("Base", &class_map), ["FromBase"]);
+        assert!(get_parents("Mid", &class_map).is_empty());
+
+        // Checked against PHP 8.4: `interface R extends P, F`, `interface P extends A, B`.
+        class_map.insert("A".to_string(), interface("A", None));
+        class_map.insert("B".to_string(), interface("B", None));
+        class_map.insert("F".to_string(), interface("F", None));
+        let mut p = interface("P", Some("A"));
+        p.implements = vec!["B".to_string()];
+        class_map.insert("P".to_string(), p);
+        let mut r = interface("R", Some("P"));
+        r.implements = vec!["F".to_string()];
+        class_map.insert("R".to_string(), r);
+        class_map.insert("UsesR".to_string(), class_info("UsesR", None, &["R"], &[]));
+        assert_eq!(class_implements("R", &class_map), ["P", "F", "B", "A"]);
+        assert_eq!(
+            class_implements("UsesR", &class_map),
+            ["R", "A", "B", "F", "P"]
+        );
+
+        class_map.insert(
+            "Items".to_string(),
+            class_info("Items", None, &["IteratorAggregate", "Countable"], &[]),
+        );
+        assert_eq!(
+            get_parents("Items", &class_map),
+            ["IteratorAggregate", "Countable", "Traversable"]
+        );
+    }
+
+    #[test]
+    fn an_area_virtual_type_is_unknown_to_the_object_manager_config() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert("Real".to_string(), class_info("Real", None, &[], &[]));
+        let global = {
+            let mut di = DiConfig::default();
+            di.plugins
+                .insert("Real".to_string(), vec![plugin("p", "P", 0, false)]);
+            di
+        };
+        let mut area = global.clone();
+        area.virtual_types.insert(
+            "AreaVirtual".to_string(),
+            di_xml_reader::VirtualType {
+                name: "AreaVirtual".to_string(),
+                type_name: "Real".to_string(),
+            },
+        );
+
+        let metadata = compile_scope_plugin_list(
+            &area,
+            &global,
+            &class_map,
+            &[],
+            &["AreaVirtual".to_string()],
+        );
+
+        assert_eq!(metadata.inherited["AreaVirtual"], None);
     }
 
     #[test]

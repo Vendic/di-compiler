@@ -19,6 +19,11 @@ pub struct DiConfig {
     /// `<type>` and `<virtualType>` names in first-seen order. Until `fold_spellings` runs
     /// they hold the spelling from the file, because `\\X` and `X` are separate nodes.
     pub type_nodes: IndexSet<String>,
+    /// Types with plugins, in the order `PluginListGenerator::merge()` first sees them.
+    pub plugin_owners: IndexSet<String>,
+    /// Virtual types with a `type` attribute in the scope merged last, in file order.
+    /// `PluginListGenerator` visits these first when it loads a scope.
+    pub scope_virtual_types: Vec<String>,
 }
 
 impl DiConfig {

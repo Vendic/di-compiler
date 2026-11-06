@@ -23,7 +23,10 @@ pub use extension::{
 pub use factory::{factory_path, generate_factory};
 pub use interceptor::{generate_interceptor, interceptor_path};
 pub use metadata::{serialize_arguments_php, serialize_interception_php};
-pub use plugin_list::{compile_plugin_list, generate_plugin_list_php, serialize_plugin_list_php};
+pub use plugin_list::{
+    compile_plugin_list, compile_scope_plugin_list, generate_plugin_list_php,
+    serialize_plugin_list_php,
+};
 pub use proxy::{generate_proxy, proxy_path};
 pub use proxy_deferred::{generate_proxy_deferred, proxy_deferred_path};
 pub use search_results::{generate_search_results, search_results_path};

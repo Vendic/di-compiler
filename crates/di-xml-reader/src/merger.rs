@@ -14,7 +14,19 @@ pub fn merge_configs(configs: Vec<DiConfig>) -> DiConfig {
     for config in configs {
         merge_into_impl(&mut result, config);
     }
+    result.plugin_owners = result
+        .type_nodes
+        .iter()
+        .filter(|node| result.plugins.contains_key(*node))
+        .map(|node| normalize(node).to_string())
+        .collect();
     result.fold_spellings();
+    result.scope_virtual_types = result
+        .type_nodes
+        .iter()
+        .filter(|node| result.virtual_types.contains_key(*node))
+        .cloned()
+        .collect();
     result
 }
 
@@ -137,6 +149,8 @@ fn merge_into_impl(dst: &mut DiConfig, src: DiConfig) {
 ///   Phase 2: apply the merged module result onto `app/etc/di.xml` (use this fn)
 pub fn apply_module_config_on_primary(mut primary: DiConfig, module: DiConfig) -> DiConfig {
     primary.type_nodes.extend(module.type_nodes);
+    primary.plugin_owners.extend(module.plugin_owners);
+    primary.scope_virtual_types = module.scope_virtual_types;
 
     // Preferences: last wins; incremental index update avoids full O(n) rebuild.
     for (k, v) in module.preferences {
@@ -265,6 +279,35 @@ mod tests {
             }
             other => panic!("expected an array, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_plugin_owners_follow_the_first_node_with_plugins() {
+        let merged = merge_configs(vec![
+            unfolded(
+                r#"<type name="Zed" shared="false"/>
+                   <type name="Middle"><plugin name="a" type="A"/></type>
+                   <type name="\\Alpha" shared="false"/>"#,
+            ),
+            unfolded(
+                r#"<type name="Zed"><plugin name="b" type="B"/></type>
+                   <type name="Alpha"><plugin name="c" type="C"/></type>"#,
+            ),
+        ]);
+        let owners: Vec<&str> = merged.plugin_owners.iter().map(String::as_str).collect();
+        assert_eq!(owners, ["Zed", "Middle", "Alpha"]);
+    }
+
+    #[test]
+    fn test_scope_virtual_types_keep_file_order_and_skip_a_missing_type() {
+        let area = merge_configs(vec![unfolded(
+            r#"<virtualType name="Zed" type="A"/><type name="Plain"/><virtualType name="Alpha" type="B"/>"#,
+        )]);
+        assert_eq!(area.scope_virtual_types, ["Zed", "Alpha"]);
+
+        let mut base = merge_configs(vec![unfolded(r#"<virtualType name="Global" type="A"/>"#)]);
+        base = apply_module_config_on_primary(base, area);
+        assert_eq!(base.scope_virtual_types, ["Zed", "Alpha"]);
     }
 
     #[test]

@@ -29,7 +29,7 @@ mod file_level_checks;
 use file_level_checks::run_file_level_checks;
 
 use code_generator::{
-    compile_plugin_list, extension_path, factory_path, generate_app_action_list_php,
+    compile_scope_plugin_list, extension_path, factory_path, generate_app_action_list_php,
     generate_area_config_with_overrides, generate_extension, generate_extension_interface,
     generate_factory, generate_interceptor, generate_proxy, generate_proxy_deferred,
     generate_search_results, interceptor_path, proxy_deferred_path, proxy_path,
@@ -1561,6 +1561,17 @@ fn main() {
         // PluginList follows the parents of every plugin owner, wherever the owner lives.
         let mut plugin_list_class_map = disabled_class_map.clone();
         plugin_list_class_map.extend(class_map.clone());
+        // Magento reads the parents of generated classes too, through the autoloader.
+        for (fqcn, info) in &generated_class_map {
+            plugin_list_class_map
+                .entry(fqcn.clone())
+                .or_insert_with(|| info.clone());
+        }
+        add_library_classes_for_plugin_list(
+            &mut plugin_list_class_map,
+            &full_di_config,
+            composer_autoload.as_ref(),
+        );
         let plugin_scopes = [
             "global",
             "adminhtml",
@@ -1577,15 +1588,22 @@ fn main() {
         );
         plugin_scopes.par_iter().for_each(|&scope| {
             if let Some(scope_di_config) = area_di_configs.get(scope) {
-                // For non-global scopes virtual types are not emitted; pass the flag
-                // directly instead of cloning + clearing the full DiConfig.
-                let include_vt = scope == "global";
+                // A scope with no di.xml of its own has the global config here, but loads
+                // no virtual types.
+                let reads_own_files = scope == "global"
+                    || !std::sync::Arc::ptr_eq(scope_di_config, &metadata_base_di_config);
+                let scope_virtual_types: &[String] = if reads_own_files {
+                    &scope_di_config.scope_virtual_types
+                } else {
+                    &[]
+                };
                 let t_scope = Instant::now();
-                let metadata = compile_plugin_list(
+                let metadata = compile_scope_plugin_list(
                     scope_di_config,
+                    &metadata_base_di_config,
                     &plugin_list_class_map,
                     &plugin_list_class_definitions,
-                    include_vt,
+                    scope_virtual_types,
                 );
                 let content = serialize_plugin_list_php(&metadata);
                 let cache_id = plugin_list_cache_id(scope);
@@ -4514,6 +4532,51 @@ fn augment_with_composer_plugin_owner_classes(
     }
 }
 
+/// `PluginListGenerator` reaches classes through the autoloader. Add what the scan left out:
+/// plugin classes, plugin owners, classes of virtual types, and the parents and interfaces
+/// of known classes in libraries.
+fn add_library_classes_for_plugin_list(
+    class_map: &mut FxHashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    composer_index: Option<&ComposerAutoloadIndex>,
+) {
+    let Some(index) = composer_index else {
+        return;
+    };
+    fn relations(info: &ClassInfo) -> impl Iterator<Item = String> + '_ {
+        info.extends.iter().chain(&info.implements).cloned()
+    }
+    let mut work: Vec<String> = class_map.values().flat_map(relations).collect();
+    work.extend(
+        di_config
+            .plugins
+            .values()
+            .flatten()
+            .map(|plugin| plugin.type_name.clone()),
+    );
+    work.extend(di_config.plugins.keys().cloned());
+    work.extend(
+        di_config
+            .virtual_types
+            .values()
+            .map(|virtual_type| virtual_type.type_name.clone()),
+    );
+    let mut tried: FxHashSet<String> = FxHashSet::default();
+    while let Some(name) = work.pop() {
+        let name = name.trim_start_matches('\\').to_string();
+        if name.is_empty() || class_map.contains_key(&name) || !tried.insert(name.clone()) {
+            continue;
+        }
+        let Some(path) = index.resolve_class_path(&name) else {
+            continue;
+        };
+        if let ExtractResult::Ok(info) = extract_file(&path) {
+            work.extend(relations(&info));
+            class_map.insert(info.fqcn.clone(), info);
+        }
+    }
+}
+
 fn interceptor_target_info_with_inherited_constructor(
     fqcn: &str,
     class_map: &FxHashMap<String, ClassInfo>,
@@ -5529,7 +5592,12 @@ fn merge_global_di_configs(configs: &[(PathBuf, DiConfig)], magento_root: &Path)
             .collect(),
     );
     let module_merged = merge_configs(module_configs.into_iter().map(|(_, c)| c.clone()).collect());
-    apply_module_config_on_primary(primary_base, module_merged)
+    // Magento loads primary and global in one step, so both their virtual types count.
+    let mut scope_virtual_types = primary_base.scope_virtual_types.clone();
+    let mut merged = apply_module_config_on_primary(primary_base, module_merged);
+    scope_virtual_types.append(&mut merged.scope_virtual_types);
+    merged.scope_virtual_types = scope_virtual_types;
+    merged
 }
 
 /// Vendor packages that must always be excluded from DI config regardless of
@@ -6009,13 +6077,11 @@ impl ComposerAutoloadIndex {
 
         // PSR-0
         for (prefix, dirs) in &self.psr0_prefixes {
-            let Some(relative) = fqcn.strip_prefix(prefix) else {
-                continue;
-            };
-            if relative.is_empty() {
+            if !fqcn.starts_with(prefix.as_str()) {
                 continue;
             }
-            let rel_path = relative.replace(['\\', '_'], "/");
+            // PSR-0 keeps the prefix in the path, unlike PSR-4.
+            let rel_path = fqcn.replace(['\\', '_'], "/");
             for dir in dirs {
                 let candidate = dir.join(format!("{rel_path}.php"));
                 if candidate.is_file() {
@@ -6180,6 +6246,87 @@ mod tests {
         info.path = path;
         info.constructor = Some(Constructor { params });
         info
+    }
+
+    #[test]
+    fn composer_psr0_keeps_the_prefix_in_the_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("Acme/Db")).unwrap();
+        let file = tmp.path().join("Acme/Db/Expr.php");
+        std::fs::write(&file, "<?php\nclass Acme_Db_Expr {}\n").unwrap();
+        let index = super::ComposerAutoloadIndex {
+            psr4_prefixes: vec![],
+            psr0_prefixes: vec![("Acme_Db".to_string(), vec![tmp.path().to_path_buf()])],
+        };
+        assert_eq!(index.resolve_class_path("Acme_Db_Expr"), Some(file));
+    }
+
+    #[test]
+    fn plugin_list_reads_library_classes_through_the_autoloader() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let write = |file: &str, php: &str| std::fs::write(tmp.path().join(file), php).unwrap();
+        write(
+            "Base.php",
+            "<?php\nnamespace Lib;\nclass Base implements Contract {}\n",
+        );
+        write(
+            "Contract.php",
+            "<?php\nnamespace Lib;\ninterface Contract {}\n",
+        );
+        write("Plug.php", "<?php\nnamespace Lib;\nclass Plug {}\n");
+        write(
+            "Owned.php",
+            "<?php\nnamespace Lib;\nclass Owned implements OwnedContract {}\n",
+        );
+        write(
+            "OwnedContract.php",
+            "<?php\nnamespace Lib;\ninterface OwnedContract {}\n",
+        );
+        let index = super::ComposerAutoloadIndex {
+            psr4_prefixes: vec![("Lib\\".to_string(), vec![tmp.path().to_path_buf()])],
+            psr0_prefixes: vec![],
+        };
+        let mut class_map = FxHashMap::default();
+        let child = ClassInfo {
+            path: PathBuf::from("Child.php"),
+            namespace: String::new(),
+            name: "Child".to_string(),
+            fqcn: "Child".to_string(),
+            kind: ClassKind::Class,
+            extends: Some("Lib\\Base".to_string()),
+            implements: vec!["Unknown\\Nowhere".to_string()],
+            constructor: None,
+            is_abstract: false,
+            is_final: false,
+            public_methods: vec![],
+        };
+        class_map.insert("Child".to_string(), child);
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "Virtual".to_string(),
+            di_xml_reader::VirtualType {
+                name: "Virtual".to_string(),
+                type_name: "Lib\\Owned".to_string(),
+            },
+        );
+        di_config.plugins.insert(
+            "Child".to_string(),
+            vec![di_xml_reader::Plugin {
+                name: "p".to_string(),
+                type_name: "\\Lib\\Plug".to_string(),
+                sort_order: None,
+                disabled: None,
+                disabled_after_type: false,
+            }],
+        );
+
+        super::add_library_classes_for_plugin_list(&mut class_map, &di_config, Some(&index));
+
+        assert!(class_map.contains_key("Lib\\Base"));
+        assert!(class_map.contains_key("Lib\\Contract"));
+        assert!(class_map.contains_key("Lib\\Plug"));
+        assert!(class_map.contains_key("Lib\\OwnedContract"));
+        assert!(!class_map.contains_key("Unknown\\Nowhere"));
     }
 
     #[test]
