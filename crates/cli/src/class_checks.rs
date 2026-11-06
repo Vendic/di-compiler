@@ -55,6 +55,12 @@ spl_autoload_register(static function (string $class) use ($generated): void {
         }
     }
 });
+// `bin/magento` sets this handler. It makes an exception of every warning and deprecation that
+// `app/bootstrap.php` lets through, so PHP compiling an old class file can stop the compile.
+$errorHandler = 'Magento\\Framework\\App\\ErrorHandler';
+if (class_exists($errorHandler)) {
+    set_error_handler([new $errorHandler(), 'handler']);
+}
 "#;
 
 const CLASS_CHECK_HEAD_PHP: &str = r#"
