@@ -1262,9 +1262,8 @@ fn main() {
         // from scratch inside canonicalize_instance_reference_case on every call.
         let case_index = build_case_index(&interception_class_map);
 
-        // OPT-DELTA: resolve all 25K types once with global interception overrides baked in.
-        // Areas typically change only ~40 type_configs; per-area re-resolution only processes
-        // the small affected set instead of all 25K types × 7 areas = 175K resolutions.
+        // Resolve every type once with global interception overrides baked in. Areas with
+        // no di.xml of their own write this result as it is.
         let global_preference_overrides = build_interception_preference_overrides(
             &metadata_base_di_config,
             &global_interceptor_map,
@@ -1312,28 +1311,7 @@ fn main() {
         });
         log_phase_elapsed("Phase 7 global arg baseline", t_global_resolve);
 
-        let t_dep_idx = Instant::now();
-        let (hierarchy_dep_rev, pref_dep_rev) =
-            di_resolver::arguments::build_dependency_reverse_index(
-                &argument_type_names,
-                &metadata_class_map,
-                &global_resolution_di_config,
-            );
-        // pref_to_iface[V] = preference keys whose resolved value is V.
-        // Used to find types injecting K via an interface when K's type_config changes.
-        let mut pref_to_iface: FxHashMap<String, Vec<String>> = FxHashMap::default();
-        for (from, to) in &global_resolution_di_config.preferences {
-            pref_to_iface
-                .entry(to.trim_start_matches('\\').to_string())
-                .or_default()
-                .push(from.trim_start_matches('\\').to_string());
-        }
-        log_phase_elapsed("Phase 7 dependency reverse index", t_dep_idx);
         let global_baseline_args = std::sync::Arc::new(global_baseline_args);
-        let global_preference_overrides = std::sync::Arc::new(global_preference_overrides);
-        let hierarchy_dep_rev = std::sync::Arc::new(hierarchy_dep_rev);
-        let pref_dep_rev = std::sync::Arc::new(pref_dep_rev);
-        let pref_to_iface = std::sync::Arc::new(pref_to_iface);
 
         // Per-area config files — each area merges global + area-specific di.xml overlays.
         // Run in parallel: each area is independent (different files, different output path).
@@ -1350,61 +1328,42 @@ fn main() {
 
                 // Only re-merge if there are area-specific files beyond the global set.
                 // Use Arc::clone for the no-overrides path to avoid cloning the large DiConfig.
-                // Collect changed di.xml keys before consuming extra_configs so OPT-DELTA can
-                // compute the affected type set without a full re-resolution.
-                let mut changed_hierarchy_keys: FxHashSet<String> = FxHashSet::default();
-                let mut changed_pref_keys: FxHashSet<String> = FxHashSet::default();
-                let area_di_config: std::sync::Arc<DiConfig> = if area_di_files.len()
-                    > di_xml_files.len()
-                {
-                    let area_only: Vec<_> = area_di_files
-                        .iter()
-                        .filter(|p| !di_xml_files_set.contains(p))
-                        .collect();
-                    if area_only.is_empty() {
-                        std::sync::Arc::clone(&metadata_base_di_config)
-                    } else {
-                        // Look up from Phase 3b cache; fall back to re-parsing only for
-                        // files not in the cache (should not happen in practice).
-                        let extra_configs: Vec<DiConfig> = area_only
+                let area_di_config: std::sync::Arc<DiConfig> =
+                    if area_di_files.len() > di_xml_files.len() {
+                        let area_only: Vec<_> = area_di_files
                             .iter()
-                            .filter_map(|p| {
-                                area_di_xml_cache
-                                    .get(*p)
-                                    .cloned()
-                                    .or_else(|| parse_di_xml(p).ok())
-                            })
+                            .filter(|p| !di_xml_files_set.contains(p))
                             .collect();
-                        // Collect which keys change so OPT-DELTA can compute the affected set.
-                        for cfg in &extra_configs {
-                            for k in cfg.type_configs.keys() {
-                                changed_hierarchy_keys
-                                    .insert(k.trim_start_matches('\\').to_string());
-                            }
-                            for k in cfg.virtual_types.keys() {
-                                changed_hierarchy_keys
-                                    .insert(k.trim_start_matches('\\').to_string());
-                            }
-                            for k in cfg.preferences.keys() {
-                                changed_pref_keys.insert(k.trim_start_matches('\\').to_string());
-                            }
+                        if area_only.is_empty() {
+                            std::sync::Arc::clone(&metadata_base_di_config)
+                        } else {
+                            // Look up from Phase 3b cache; fall back to re-parsing only for
+                            // files not in the cache (should not happen in practice).
+                            let extra_configs: Vec<DiConfig> = area_only
+                                .iter()
+                                .filter_map(|p| {
+                                    area_di_xml_cache
+                                        .get(*p)
+                                        .cloned()
+                                        .or_else(|| parse_di_xml(p).ok())
+                                })
+                                .collect();
+                            // Area-specific module configs applied via the same two-phase merge as
+                            // global: deep-merge area module configs together, then apply on the
+                            // global base using shallow (array_replace) semantics per PHP behaviour.
+                            let mut merged_area = apply_module_config_on_primary(
+                                (*metadata_base_di_config).clone(),
+                                merge_configs(extra_configs),
+                            );
+                            apply_resolved_constants_to_di_config(
+                                &mut merged_area,
+                                &resolved_const_values,
+                            );
+                            std::sync::Arc::new(merged_area)
                         }
-                        // Area-specific module configs applied via the same two-phase merge as
-                        // global: deep-merge area module configs together, then apply on the
-                        // global base using shallow (array_replace) semantics per PHP behaviour.
-                        let mut merged_area = apply_module_config_on_primary(
-                            (*metadata_base_di_config).clone(),
-                            merge_configs(extra_configs),
-                        );
-                        apply_resolved_constants_to_di_config(
-                            &mut merged_area,
-                            &resolved_const_values,
-                        );
-                        std::sync::Arc::new(merged_area)
-                    }
-                } else {
-                    std::sync::Arc::clone(&metadata_base_di_config)
-                };
+                    } else {
+                        std::sync::Arc::clone(&metadata_base_di_config)
+                    };
 
                 // Build area-specific preference overrides.
                 // global_interceptor_map is shared read-only; no per-area clone needed.
@@ -1413,24 +1372,7 @@ fn main() {
                     &global_interceptor_map,
                 );
 
-                // OPT-DELTA: also treat preference keys where area diverges from global as changed.
-                for (from, to) in &area_preference_overrides {
-                    if global_preference_overrides.get(from.as_str()) != Some(to) {
-                        changed_pref_keys.insert(from.trim_start_matches('\\').to_string());
-                    }
-                }
-                for from in global_preference_overrides.keys() {
-                    if !area_preference_overrides.contains_key(from.as_str()) {
-                        changed_pref_keys.insert(from.trim_start_matches('\\').to_string());
-                    }
-                }
-
-                // OPT-DELTA: compute the set of types whose resolution could differ from the
-                // global baseline.  Only these types need a delta re-resolution.
-                let mut affected: FxHashSet<String> = FxHashSet::default();
-
-                // Extra VTs introduced in area di.xml are absent from the global baseline —
-                // they always need fresh resolution.
+                // Extra VTs introduced in area di.xml are absent from the global baseline.
                 let base_set: FxHashSet<&str> =
                     argument_type_names.iter().map(|s| s.as_str()).collect();
                 let area_extra_vt_names: Vec<String> = area_di_config
@@ -1439,120 +1381,82 @@ fn main() {
                     .filter(|k| !base_set.contains(k.as_str()))
                     .cloned()
                     .collect();
-                for name in &area_extra_vt_names {
-                    affected.insert(name.clone());
-                }
 
-                for k in &changed_hierarchy_keys {
-                    // Types that access K in their hierarchy walk.
-                    if let Some(types) = hierarchy_dep_rev.get(k) {
-                        for t in types {
-                            affected.insert(t.clone());
-                        }
-                    }
-                    // Types that directly inject K as a constructor type hint (K's type_config
-                    // changes affect whether args resolve as shared or non-shared).
-                    if let Some(types) = pref_dep_rev.get(k) {
-                        for t in types {
-                            affected.insert(t.clone());
-                        }
-                    }
-                    // Transitive: types that inject K via a preference (interface I → K).
-                    // Their resolved concrete type is K; K's type_config change affects them too.
-                    if let Some(ifaces) = pref_to_iface.get(k) {
-                        for iface in ifaces {
-                            if let Some(types) = pref_dep_rev.get(iface) {
-                                for t in types {
-                                    affected.insert(t.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                for p in &changed_pref_keys {
-                    // Types that inject via preference key P — the resolved concrete type may change.
-                    if let Some(types) = pref_dep_rev.get(p) {
-                        for t in types {
-                            affected.insert(t.clone());
-                        }
-                    }
-                }
-
-                let t_area_delta = Instant::now();
-                let affected_count = affected.len();
-                let area_content = if affected.is_empty() {
-                    // Fast path: global baseline applies as-is — no clone needed.
-                    generate_area_config_with_overrides(
-                        &global_baseline_args,
-                        &FxHashMap::default(),
-                        &area_di_config,
-                        &area_preference_overrides,
-                        &global_interceptor_map,
-                    )
-                } else {
-                    // Delta path: build area_di_config_for_args with interception overrides.
-                    let mut area_di_config_for_args = (*area_di_config).clone();
-                    for (from, to) in &area_preference_overrides {
-                        // Keep VT argument values stable: synthetic interception overrides for
-                        // virtual-type names should not participate in argument object resolution.
-                        if area_di_config_for_args
-                            .virtual_types
-                            .contains_key(from.as_str())
-                        {
-                            continue;
-                        }
-                        area_di_config_for_args.insert_preference(from.clone(), to.clone());
-                    }
-
-                    // Resolve only the affected types (plus any new area VTs).
-                    let affected_names: Vec<String> = affected.into_iter().collect();
-                    let mut delta_args = resolve_all_arguments_for_named_types(
-                        &affected_names,
-                        &metadata_class_map,
-                        &base_class_fqcns,
-                        &area_di_config_for_args,
-                        &const_map,
-                    );
-                    apply_case_index(&mut delta_args, &case_index);
-                    // Apply the same interceptor filter to the delta results.
-                    delta_args.retain(|fqcn, args| {
-                        if !global_interceptor_map.contains_key(fqcn) {
-                            return true;
-                        }
-                        if metadata_base_di_config
-                            .virtual_types
-                            .contains_key(fqcn.as_str())
-                        {
-                            return true;
-                        }
-                        if !args.is_empty() {
-                            return false;
-                        }
-                        let normalized = fqcn.trim_start_matches('\\');
-                        if !base_class_fqcns.contains(normalized) {
-                            return false;
-                        }
-                        matches!(
-                            metadata_class_map.get(normalized).map(|info| &info.kind),
-                            Some(ClassKind::Class) | Some(ClassKind::Trait)
+                let t_area_args = Instant::now();
+                let area_content =
+                    if std::sync::Arc::ptr_eq(&area_di_config, &metadata_base_di_config) {
+                        // No area-specific di.xml: the global baseline applies as-is.
+                        generate_area_config_with_overrides(
+                            &global_baseline_args,
+                            &FxHashMap::default(),
+                            &area_di_config,
+                            &area_preference_overrides,
+                            &global_interceptor_map,
                         )
-                    });
-                    // OVERLAY: pass baseline + delta directly — no 25K HashMap clone.
-                    generate_area_config_with_overrides(
-                        &global_baseline_args,
-                        &delta_args,
-                        &area_di_config,
-                        &area_preference_overrides,
-                        &global_interceptor_map,
-                    )
-                };
+                    } else {
+                        // Magento resolves every type against the merged area config
+                        // (Compiler\Config\Reader::generateCachePerScope), because an area
+                        // preference or shared setting can reach any configured object at any
+                        // depth. Build area_di_config_for_args with interception overrides.
+                        let mut area_di_config_for_args = (*area_di_config).clone();
+                        for (from, to) in &area_preference_overrides {
+                            // Keep VT argument values stable: synthetic interception overrides for
+                            // virtual-type names should not participate in argument object resolution.
+                            if area_di_config_for_args
+                                .virtual_types
+                                .contains_key(from.as_str())
+                            {
+                                continue;
+                            }
+                            area_di_config_for_args.insert_preference(from.clone(), to.clone());
+                        }
+
+                        let mut area_type_names: Vec<String> = (*argument_type_names).clone();
+                        area_type_names.extend(area_extra_vt_names.iter().cloned());
+                        let mut area_args = resolve_all_arguments_for_named_types(
+                            &area_type_names,
+                            &metadata_class_map,
+                            &base_class_fqcns,
+                            &area_di_config_for_args,
+                            &const_map,
+                        );
+                        apply_case_index(&mut area_args, &case_index);
+                        // Apply the same interceptor filter as the global baseline.
+                        area_args.retain(|fqcn, args| {
+                            if !global_interceptor_map.contains_key(fqcn) {
+                                return true;
+                            }
+                            if metadata_base_di_config
+                                .virtual_types
+                                .contains_key(fqcn.as_str())
+                            {
+                                return true;
+                            }
+                            if !args.is_empty() {
+                                return false;
+                            }
+                            let normalized = fqcn.trim_start_matches('\\');
+                            if !base_class_fqcns.contains(normalized) {
+                                return false;
+                            }
+                            matches!(
+                                metadata_class_map.get(normalized).map(|info| &info.kind),
+                                Some(ClassKind::Class) | Some(ClassKind::Trait)
+                            )
+                        });
+                        generate_area_config_with_overrides(
+                            &area_args,
+                            &FxHashMap::default(),
+                            &area_di_config,
+                            &area_preference_overrides,
+                            &global_interceptor_map,
+                        )
+                    };
                 log::debug!(
-                    "Phase 7 area={} delta (changed_keys={}, affected={}, extra_vt={}): {:?}",
+                    "Phase 7 area={} args (extra_vt={}): {:?}",
                     area,
-                    changed_hierarchy_keys.len() + changed_pref_keys.len(),
-                    affected_count,
                     area_extra_vt_names.len(),
-                    t_area_delta.elapsed()
+                    t_area_args.elapsed()
                 );
                 let area_path = metadata_root.join(format!("{}.php", area));
                 let _ = write_if_changed(&area_path, &area_content);
