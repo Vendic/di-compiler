@@ -79,9 +79,13 @@ impl DiConfig {
         let mut plugins: Vec<&Plugin> = self
             .plugins
             .get(&name)
-            .map(|ps| ps.iter().filter(|p| !p.disabled).collect())
+            .map(|ps| ps.iter().filter(|p| p.is_active()).collect())
             .unwrap_or_default();
-        plugins.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.name.cmp(&b.name)));
+        plugins.sort_by(|a, b| {
+            a.effective_sort_order()
+                .cmp(&b.effective_sort_order())
+                .then(a.name.cmp(&b.name))
+        });
         plugins
     }
 
@@ -508,20 +512,23 @@ mod tests {
                 Plugin {
                     name: "c".into(),
                     type_name: "TC".into(),
-                    sort_order: 30,
-                    disabled: false,
+                    sort_order: Some(30),
+                    disabled: Some(false),
+                    disabled_after_type: false,
                 },
                 Plugin {
                     name: "b".into(),
                     type_name: "TB".into(),
-                    sort_order: 10,
-                    disabled: false,
+                    sort_order: Some(10),
+                    disabled: Some(false),
+                    disabled_after_type: false,
                 },
                 Plugin {
                     name: "a".into(),
                     type_name: "TA".into(),
-                    sort_order: 10,
-                    disabled: true,
+                    sort_order: Some(10),
+                    disabled: Some(true),
+                    disabled_after_type: false,
                 },
             ],
         );
