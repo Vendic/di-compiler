@@ -1,5 +1,6 @@
 //! Loads every scanned class in PHP, as `ClassesScanner::includeClass()` does during compile,
-//! and reads its constructor, as `ClassReader::getConstructor()` does.
+//! reads its constructor, as `ClassReader::getConstructor()` does, and validates it, as
+//! `Decorator\\Interceptions::getList()` does.
 //!
 //! A class file that PHP cannot load stops `setup:di:compile`. Most reasons cannot be seen from
 //! the source: a parent that is not on the autoload path, a signature that does not fit the
@@ -19,7 +20,7 @@ use serde::Deserialize;
 
 const CLASS_CHECK_PHP: &str = r#"
 ini_set('display_errors', '0');
-[, $mode, $root, $generated] = $argv;
+[, $mode, $root, $generated, $validate] = $argv;
 $entries = [];
 foreach (file('php://stdin', FILE_IGNORE_NEW_LINES) as $line) {
     $entries[] = explode("\t", $line);
@@ -102,12 +103,20 @@ $readConstructor = static function (string $class) use ($reader): void {
         }
     }
 };
-$check = static function (string $class, string $file) use ($load, $readConstructor): void {
+// `Decorator\\Interceptions::getList()` validates everything except `setup/`. This is the store's
+// own validator, because what it lets through differs per Magento version.
+$validator = 'Magento\\Framework\\Code\\Validator\\ConstructorIntegrity';
+$validator = $validate === '1' && class_exists($validator) ? new $validator() : null;
+$setup = $root . '/setup/';
+$check = static function (string $class, string $file) use ($load, $readConstructor, $validator, $setup): void {
     $load($class, $file);
     $readConstructor($class);
+    if ($validator !== null && !str_starts_with($file, $setup)) {
+        $validator->validate($class);
+    }
 };
 $describe = static function (\Throwable $e): string {
-    return $e instanceof ReflectionException
+    return $e instanceof ReflectionException || $e instanceof \Magento\Framework\Exception\ValidatorException
         ? $e->getMessage()
         : 'There is an error in ' . $e->getFile() . ' at line: ' . $e->getLine() . ': ' . $e->getMessage();
 };
@@ -197,6 +206,7 @@ pub(crate) struct ClassChecks {
     root: PathBuf,
     code_root: PathBuf,
     php_bin: String,
+    validate: bool,
 }
 
 fn entry_line(entry: &ScannedFile, failed: bool) -> String {
@@ -215,6 +225,7 @@ impl ClassChecks {
         code_root: &Path,
         php_bin: &str,
         jobs: usize,
+        validate: bool,
     ) -> Self {
         // Without an autoloader this is not a Magento store, and PHP can load nothing.
         if !root.join("vendor/autoload.php").is_file() {
@@ -231,7 +242,7 @@ impl ClassChecks {
             let code_root = code_root.to_path_buf();
             let php_bin = php_bin.to_string();
             shards.push(std::thread::spawn(move || {
-                run_shard(&lines, offset, &root, &code_root, &php_bin)
+                run_shard(&lines, offset, &root, &code_root, &php_bin, validate)
             }));
         }
         Self {
@@ -240,6 +251,7 @@ impl ClassChecks {
             root: root.to_path_buf(),
             code_root: code_root.to_path_buf(),
             php_bin: php_bin.to_string(),
+            validate,
         }
     }
 
@@ -263,6 +275,7 @@ impl ClassChecks {
             &self.root,
             &self.code_root,
             &self.php_bin,
+            self.validate,
         )
     }
 }
@@ -278,11 +291,13 @@ fn run_php(
     root: &Path,
     code_root: &Path,
     php_bin: &str,
+    validate: bool,
 ) -> Result<Run, String> {
     let spawned = Command::new(php_bin)
         .args(["-d", "display_errors=0", "-r", CLASS_CHECK_PHP, "--", mode])
         .arg(root)
         .arg(code_root)
+        .arg(if validate { "1" } else { "0" })
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -319,11 +334,19 @@ fn run_shard(
     root: &Path,
     code_root: &Path,
     php_bin: &str,
+    validate: bool,
 ) -> Result<Vec<Failure>, String> {
     let mut failures = Vec::new();
     let mut start = 0;
     while start < lines.len() {
-        let run = run_php("check", &lines[start..].concat(), root, code_root, php_bin)?;
+        let run = run_php(
+            "check",
+            &lines[start..].concat(),
+            root,
+            code_root,
+            php_bin,
+            validate,
+        )?;
         let Run::Rows(rows, code) = run else {
             return Ok(failures);
         };
@@ -358,6 +381,7 @@ fn confirm(
     root: &Path,
     code_root: &Path,
     php_bin: &str,
+    validate: bool,
 ) -> Result<(), String> {
     let is_failed = |index: usize| failures.iter().any(|failure| failure.index == index);
     let mut order: Vec<usize> = (0..entries.len()).filter(|i| !is_failed(*i)).collect();
@@ -368,7 +392,8 @@ fn confirm(
         .enumerate()
         .map(|(position, index)| entry_line(&entries[*index], position >= passed))
         .collect();
-    let Run::Rows(rows, code) = run_php("confirm", &input, root, code_root, php_bin)? else {
+    let Run::Rows(rows, code) = run_php("confirm", &input, root, code_root, php_bin, validate)?
+    else {
         return Ok(());
     };
     if rows.iter().any(|row| row.done == Some(true)) {
