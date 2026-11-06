@@ -18,27 +18,8 @@ use std::thread::JoinHandle;
 
 use serde::Deserialize;
 
-const CLASS_CHECK_PHP: &str = r#"
-ini_set('display_errors', '0');
-[, $mode, $root, $generated, $validate] = $argv;
-$entries = [];
-foreach (file('php://stdin', FILE_IGNORE_NEW_LINES) as $line) {
-    $entries[] = explode("\t", $line);
-}
-$emit = static function (array $row): void {
-    fwrite(STDOUT, json_encode($row, JSON_INVALID_UTF8_SUBSTITUTE) . "\n");
-};
-$current = null;
-$finished = false;
-register_shutdown_function(static function () use (&$current, &$finished, $emit): void {
-    if ($finished) {
-        return;
-    }
-    $last = error_get_last();
-    $emit(['i' => $current, 'error' => $last !== null && ($last['type'] & (E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR))
-        ? 'There is an error in ' . $last['file'] . ' at line: ' . $last['line'] . ': ' . $last['message']
-        : 'The file ended the PHP process']);
-});
+/// Sets up PHP as `bin/magento` does. Needs `$root` and `$generated`. Loaded class files can print.
+pub(crate) const BOOT_PHP: &str = r#"
 ob_start();
 require is_file($root . '/app/bootstrap.php') ? $root . '/app/bootstrap.php' : $root . '/vendor/autoload.php';
 while (ob_get_level() > 0) {
@@ -74,6 +55,32 @@ spl_autoload_register(static function (string $class) use ($generated): void {
         }
     }
 });
+"#;
+
+const CLASS_CHECK_HEAD_PHP: &str = r#"
+ini_set('display_errors', '0');
+[, $mode, $root, $generated, $validate] = $argv;
+$entries = [];
+foreach (file('php://stdin', FILE_IGNORE_NEW_LINES) as $line) {
+    $entries[] = explode("\t", $line);
+}
+$emit = static function (array $row): void {
+    fwrite(STDOUT, json_encode($row, JSON_INVALID_UTF8_SUBSTITUTE) . "\n");
+};
+$current = null;
+$finished = false;
+register_shutdown_function(static function () use (&$current, &$finished, $emit): void {
+    if ($finished) {
+        return;
+    }
+    $last = error_get_last();
+    $emit(['i' => $current, 'error' => $last !== null && ($last['type'] & (E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR))
+        ? 'There is an error in ' . $last['file'] . ' at line: ' . $last['line'] . ': ' . $last['message']
+        : 'The file ended the PHP process']);
+});
+"#;
+
+const CLASS_CHECK_PHP: &str = r#"
 $scanner = 'Magento\\Setup\\Module\\Di\\Code\\Reader\\FileClassScanner';
 // `extract()` in `ClassesScanner` takes the class name from `FileClassScanner`.
 $className = static function (string $file) use ($scanner): string {
@@ -294,7 +301,9 @@ fn run_php(
     validate: bool,
 ) -> Result<Run, String> {
     let spawned = Command::new(php_bin)
-        .args(["-d", "display_errors=0", "-r", CLASS_CHECK_PHP, "--", mode])
+        .args(["-d", "display_errors=0", "-r"])
+        .arg(format!("{CLASS_CHECK_HEAD_PHP}{BOOT_PHP}{CLASS_CHECK_PHP}"))
+        .args(["--", mode])
         .arg(root)
         .arg(code_root)
         .arg(if validate { "1" } else { "0" })
