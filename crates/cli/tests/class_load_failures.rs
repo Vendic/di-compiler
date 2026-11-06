@@ -189,6 +189,10 @@ fn broken_file_under_test_does_not_stop_the_compile() {
 #[test]
 fn parent_that_magento_would_generate_does_not_stop_the_compile() {
     let Some(output) = compile_with(&[
+        (
+            "app/code/Magento/Framework/ObjectManagerInterface.php",
+            "<?php\nnamespace Magento\\Framework;\n\ninterface ObjectManagerInterface\n{\n}\n",
+        ),
         (THING, &model("class Thing extends GadgetFactory {}")),
         (
             "app/code/Acme/On/Model/Other.php",
