@@ -148,7 +148,7 @@ fn a_file_that_throws_while_it_loads_stops_the_compile() {
 }
 
 #[test]
-fn every_failure_after_a_fatal_error_is_still_found() {
+fn a_fatal_error_is_reported_when_a_later_class_also_fails() {
     let Some(output) = compile_with(&[
         (
             "app/code/Acme/On/Model/Fatal.php",

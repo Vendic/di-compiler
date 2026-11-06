@@ -90,6 +90,7 @@ fn write_fixture(root: &Path) {
         "Acme\\On\\Controller\\Index\\Index",
         "class Index\n{\n}",
     );
+    write_class(root, on, "Acme\\On\\Model\\Enabled", "class Enabled\n{\n}");
     write_class(
         root,
         on,

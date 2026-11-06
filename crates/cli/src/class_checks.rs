@@ -1,4 +1,5 @@
-//! Loads every scanned class in PHP, as `ClassesScanner::includeClass()` does during compile.
+//! Loads every scanned class in PHP, as `ClassesScanner::includeClass()` does during compile,
+//! and reads its constructor, as `ClassReader::getConstructor()` does.
 //!
 //! A class file that PHP cannot load stops `setup:di:compile`. Most reasons cannot be seen from
 //! the source: a parent that is not on the autoload path, a signature that does not fit the
@@ -77,13 +78,38 @@ $scanner = 'Magento\\Setup\\Module\\Di\\Code\\Reader\\FileClassScanner';
 $className = static function (string $file) use ($scanner): string {
     return class_exists($scanner) ? (new $scanner($file))->getClassName() : '';
 };
-$check = static function (string $class, string $file): void {
+$load = static function (string $class, string $file): void {
     if (!class_exists($class)) {
         require_once $file;
     }
 };
+// `Decorator\Area::getList()` calls `ClassReader::getConstructor()` on every scanned class.
+$reader = 'Magento\\Framework\\Code\\Reader\\ClassReader';
+$reader = class_exists($reader) ? new $reader() : null;
+$readConstructor = static function (string $class) use ($reader): void {
+    if ($reader !== null) {
+        $reader->getConstructor($class);
+        return;
+    }
+    foreach ((new ReflectionClass($class))->getConstructor()?->getParameters() ?? [] as $parameter) {
+        $type = $parameter->getType();
+        if ($type instanceof ReflectionNamedType && !$type->isBuiltin()) {
+            try {
+                new ReflectionClass($type->getName());
+            } catch (ReflectionException $e) {
+                throw new ReflectionException('Impossible to process constructor argument ' . $parameter . ' of ' . $class . ' class', 0, $e);
+            }
+        }
+    }
+};
+$check = static function (string $class, string $file) use ($load, $readConstructor): void {
+    $load($class, $file);
+    $readConstructor($class);
+};
 $describe = static function (\Throwable $e): string {
-    return 'There is an error in ' . $e->getFile() . ' at line: ' . $e->getLine() . ': ' . $e->getMessage();
+    return $e instanceof ReflectionException
+        ? $e->getMessage()
+        : 'There is an error in ' . $e->getFile() . ' at line: ' . $e->getLine() . ': ' . $e->getMessage();
 };
 $level = ob_get_level();
 if ($mode === 'check') {
@@ -120,7 +146,7 @@ if ($mode === 'check') {
         if ($failed === '') {
             try {
                 if ($class !== '') {
-                    $check($class, $file);
+                    $load($class, $file);
                 }
             } catch (\Throwable) {
             }
