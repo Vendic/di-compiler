@@ -446,8 +446,8 @@ fn parse_ctor_params_ts(
     let mut params = Vec::new();
     for child in iter_children(params_node) {
         match child.kind() {
-            "simple_parameter" | "variadic_parameter" | "promoted_parameter" => {
-                let is_promoted = child.kind() == "promoted_parameter";
+            "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
+                let is_promoted = child.kind() == "property_promotion_parameter";
                 let is_variadic = child.kind() == "variadic_parameter";
 
                 let type_hint = child.child_by_field_name("type").map(|n| {
@@ -459,7 +459,8 @@ fn parse_ctor_params_ts(
                     .child_by_field_name("name")
                     .map(|n| {
                         let s = node_text(n, src).trim();
-                        s.trim_start_matches('$').to_string()
+                        // In a promoted parameter the name node includes a by-reference `&`.
+                        s.trim_start_matches(['&', ' ', '$']).to_string()
                     })
                     .unwrap_or_default();
 
@@ -501,7 +502,7 @@ fn parse_method_params_ts(
     if let Some(params_node) = method.child_by_field_name("parameters") {
         for child in iter_children(params_node) {
             match child.kind() {
-                "simple_parameter" | "variadic_parameter" | "promoted_parameter" => {
+                "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
                     let is_variadic = child.kind() == "variadic_parameter";
                     let type_hint = child.child_by_field_name("type").map(|n| {
                         let raw = extract_type_from_node(n, src);
@@ -685,5 +686,26 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn test_tier2_reads_promoted_constructor_parameters() {
+        // The intersection type sends this file from Tier 1 to Tier 2.
+        let result = extract(
+            "<?php\nnamespace Foo;\nclass Bar {\n    public function __construct(\n        private readonly Baz&Qux $x,\n        Dep $y,\n        protected ?Dep $z = null,\n        public int &$r = 0,\n    ) {}\n}",
+        );
+        let ExtractResult::Ok(info) = result else {
+            panic!("Expected Ok, got {:?}", result);
+        };
+        let params = info.constructor.unwrap().params;
+        let names: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["x", "y", "z", "r"]);
+        let promoted: Vec<_> = params.iter().map(|p| p.is_promoted).collect();
+        assert_eq!(promoted, [true, false, true, true]);
+        assert!(!params[0].is_optional);
+        assert_eq!(params[2].default_value.as_deref(), Some("null"));
+        assert!(params[2].is_optional);
+        assert_eq!(params[2].type_hint.as_deref(), Some("?Foo\\Dep"));
+        assert!(params[3].is_primitive);
     }
 }
