@@ -714,6 +714,7 @@ fn main() {
         .collect();
     let source_exists = |fqcn: &str| {
         class_map.contains_key(fqcn)
+            || disabled_class_map.contains_key(fqcn)
             || composer_autoload
                 .as_ref()
                 .is_some_and(|index| index.is_loadable(fqcn))
