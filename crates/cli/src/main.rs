@@ -947,6 +947,8 @@ fn main() {
         generated_class_source_exists(&spec.target_fqcn, &source_exists)
             || plugin_class_failure(&spec.target_fqcn).is_none()
     });
+    // A proxy needs a source class, and a factory exists once it is generated.
+    extra_existing_proxy_targets.extend(factories.iter().map(|spec| spec.factory_fqcn.clone()));
     let proxies = detect_proxies_from_configs_with_existing(
         &class_map,
         &scanner_di_configs,
