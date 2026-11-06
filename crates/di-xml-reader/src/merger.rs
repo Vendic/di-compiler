@@ -282,6 +282,23 @@ mod tests {
     }
 
     #[test]
+    fn test_argument_without_type_adds_its_items_to_the_array_of_an_earlier_file() {
+        let merged = merge_configs(vec![
+            unfolded(
+                r#"<type name="Grid"><arguments><argument name="columns" xsi:type="array">
+                       <item name="first" xsi:type="string">a</item>
+                   </argument></arguments></type>"#,
+            ),
+            unfolded(
+                r#"<type name="Grid"><arguments><argument name="columns">
+                       <item name="second" xsi:type="string">b</item>
+                   </argument></arguments></type>"#,
+            ),
+        ]);
+        assert_eq!(array_items(&merged, "Grid"), ["first", "second"]);
+    }
+
+    #[test]
     fn test_plugin_owners_follow_the_first_node_with_plugins() {
         let merged = merge_configs(vec![
             unfolded(
