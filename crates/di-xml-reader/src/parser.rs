@@ -79,20 +79,19 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         let owner = current_type.as_ref().or(current_virtual.as_ref());
                         if let Some(owner) = owner.cloned() {
                             let name = attrs.get("name").cloned().unwrap_or_default();
-                            let plugin_type =
-                                normalize(&attrs.get("type").cloned().unwrap_or_default());
-                            let sort_order: i32 = attrs
-                                .get("sortOrder")
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-                            let disabled =
-                                attrs.get("disabled").map(|s| s == "true").unwrap_or(false);
-                            if !name.is_empty() && (!plugin_type.is_empty() || disabled) {
+                            if !name.is_empty() {
                                 config.plugins.entry(owner).or_default().push(Plugin {
                                     name,
-                                    type_name: plugin_type,
-                                    sort_order,
-                                    disabled,
+                                    type_name: normalize(
+                                        &attrs.get("type").cloned().unwrap_or_default(),
+                                    ),
+                                    sort_order: attrs
+                                        .get("sortOrder")
+                                        .map(|s| s.parse().unwrap_or(0)),
+                                    disabled: attrs
+                                        .get("disabled")
+                                        .map(|s| s == "true" || s == "1"),
+                                    disabled_after_type: false,
                                 });
                             }
                         }
@@ -203,20 +202,19 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         let owner = current_type.as_ref().or(current_virtual.as_ref());
                         if let Some(owner) = owner.cloned() {
                             let name = attrs.get("name").cloned().unwrap_or_default();
-                            let plugin_type =
-                                normalize(&attrs.get("type").cloned().unwrap_or_default());
-                            let sort_order: i32 = attrs
-                                .get("sortOrder")
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-                            let disabled =
-                                attrs.get("disabled").map(|s| s == "true").unwrap_or(false);
-                            if !name.is_empty() && (!plugin_type.is_empty() || disabled) {
+                            if !name.is_empty() {
                                 config.plugins.entry(owner).or_default().push(Plugin {
                                     name,
-                                    type_name: plugin_type,
-                                    sort_order,
-                                    disabled,
+                                    type_name: normalize(
+                                        &attrs.get("type").cloned().unwrap_or_default(),
+                                    ),
+                                    sort_order: attrs
+                                        .get("sortOrder")
+                                        .map(|s| s.parse().unwrap_or(0)),
+                                    disabled: attrs
+                                        .get("disabled")
+                                        .map(|s| s == "true" || s == "1"),
+                                    disabled_after_type: false,
                                 });
                             }
                         }
@@ -477,8 +475,29 @@ mod tests {
         let plugins = config.plugins.get("Foo\\Bar").unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "myPlugin");
-        assert_eq!(plugins[0].sort_order, 10);
-        assert!(!plugins[0].disabled);
+        assert_eq!(plugins[0].sort_order, Some(10));
+        assert_eq!(plugins[0].disabled, Some(false));
+    }
+
+    #[test]
+    fn test_parse_plugin_keeps_overrides_without_type() {
+        let xml = br#"<?xml version="1.0"?>
+<config>
+    <type name="Foo\Bar">
+        <plugin name="sorted" sortOrder="5"/>
+        <plugin name="off" disabled="1"/>
+        <plugin name="on" disabled="false"></plugin>
+    </type>
+</config>"#;
+        let config = parse_di_xml_bytes(xml).unwrap();
+        let plugins = config.plugins.get("Foo\\Bar").unwrap();
+        assert_eq!(plugins.len(), 3);
+        assert_eq!(plugins[0].sort_order, Some(5));
+        assert_eq!(plugins[0].disabled, None);
+        assert!(plugins[0].type_name.is_empty());
+        assert_eq!(plugins[1].sort_order, None);
+        assert!(plugins[1].is_disabled());
+        assert_eq!(plugins[2].disabled, Some(false));
     }
 
     #[test]
@@ -491,7 +510,7 @@ mod tests {
 </config>"#;
         let config = parse_di_xml_bytes(xml).unwrap();
         let plugins = config.plugins.get("Foo\\Bar").unwrap();
-        assert!(plugins[0].disabled);
+        assert!(plugins[0].is_disabled());
     }
 
     #[test]

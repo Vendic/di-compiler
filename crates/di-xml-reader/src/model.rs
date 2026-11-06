@@ -62,9 +62,57 @@ impl DiConfig {
 #[derive(Debug, Clone)]
 pub struct Plugin {
     pub name: String,
+    /// Empty when the entry has no `type` attribute: an override of a plugin declared
+    /// elsewhere, in an earlier scope or on a parent type.
     pub type_name: String,
-    pub sort_order: i32,
-    pub disabled: bool,
+    /// `None` when the entry has no `sortOrder` attribute.
+    pub sort_order: Option<i32>,
+    /// `None` when the entry has no `disabled` attribute.
+    pub disabled: Option<bool>,
+    /// A later scope added `disabled` to an entry that already had a `type`, so Magento
+    /// writes `disabled` after `instance` in this row.
+    pub disabled_after_type: bool,
+}
+
+impl Plugin {
+    pub fn is_disabled(&self) -> bool {
+        self.disabled == Some(true)
+    }
+
+    /// Disabled entries and entries nobody gave a class never run.
+    pub fn is_active(&self) -> bool {
+        !self.type_name.is_empty() && !self.is_disabled()
+    }
+
+    /// `ObjectManager\Config\Mapper\Dom` writes 0 when `sortOrder` is absent.
+    pub fn effective_sort_order(&self) -> i32 {
+        self.sort_order.unwrap_or(0)
+    }
+
+    /// Merge a later file of the same scope. Magento merges these files as a DOM, so an
+    /// absent attribute keeps the earlier value.
+    pub fn merge_same_scope(&mut self, later: Plugin) {
+        if !later.type_name.is_empty() {
+            self.type_name = later.type_name;
+        }
+        if later.sort_order.is_some() {
+            self.sort_order = later.sort_order;
+        }
+        if later.disabled.is_some() {
+            self.disabled = later.disabled;
+        }
+    }
+
+    /// Merge a later scope. `PluginListGenerator::merge()` uses array_replace_recursive on
+    /// mapped rows, and those always hold `sortOrder`, so an absent one resets to 0.
+    pub fn merge_later_scope(&mut self, later: Plugin) {
+        if !self.type_name.is_empty() && self.disabled.is_none() && later.disabled.is_some() {
+            self.disabled_after_type = true;
+        }
+        let sort_order = later.effective_sort_order();
+        self.merge_same_scope(later);
+        self.sort_order = Some(sort_order);
+    }
 }
 
 #[derive(Debug, Clone)]
