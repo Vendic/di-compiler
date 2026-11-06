@@ -183,6 +183,7 @@ mod tests {
             is_abstract: false,
             is_final: false,
             public_methods: vec![],
+            traits: Default::default(),
         }
     }
 

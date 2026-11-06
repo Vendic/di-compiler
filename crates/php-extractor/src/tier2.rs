@@ -7,7 +7,7 @@ use tree_sitter::{Node, Parser};
 
 use crate::types::{
     ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
-    MethodSignature,
+    MethodSignature, TraitData, TraitMethod,
 };
 
 pub fn extract_tier2(path: &Path) -> ExtractResult {
@@ -125,35 +125,65 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
 
     let mut constructor: Option<Constructor> = None;
     let mut public_methods: Vec<MethodSignature> = Vec::new();
+    let mut traits = TraitData::default();
+    let is_trait = matches!(kind, ClassKind::Trait);
 
     if let Some(body) = body_node {
         for member in iter_children(body) {
+            if member.kind() == "use_declaration" {
+                crate::lexer::Lexer::read_trait_use_text(
+                    node_text(member, src),
+                    &namespace,
+                    &use_map,
+                    &mut traits,
+                )
+                .map_err(|e| format!("trait use: {e}"))?;
+            }
             if member.kind() == "method_declaration" {
                 let method_name = member
                     .child_by_field_name("name")
                     .map(|n| node_text(n, src).trim().to_string())
                     .unwrap_or_default();
 
+                let is_abstract_method = has_modifier(member, src, "abstract");
                 if method_name == "__construct" {
-                    constructor = Some(parse_constructor(member, src, &namespace, &use_map));
+                    // An abstract constructor in a trait only asks for one. It is not one.
+                    if !(is_trait && is_abstract_method) {
+                        constructor = Some(parse_constructor(member, src, &namespace, &use_map));
+                    }
                 } else {
                     // Check visibility
-                    let vis = get_visibility(member, src);
+                    let is_public = get_visibility(member, src) == "public";
                     let is_final_method = has_modifier(member, src, "final");
-                    if vis == "public" && !is_final_method {
+                    if is_trait || (is_public && !is_final_method) {
                         let is_static = has_modifier(member, src, "static");
                         let returns_reference = node_text(member, src).contains("function &");
                         let params = parse_method_params_ts(member, src, &namespace, &use_map);
                         let return_type = member
                             .child_by_field_name("return_type")
                             .map(|n| node_text(n, src).trim_start_matches(':').trim().to_string());
-                        public_methods.push(MethodSignature {
+                        let signature = MethodSignature {
                             name: method_name,
                             params,
                             return_type,
                             is_static,
                             returns_reference,
-                        });
+                        };
+                        if is_trait {
+                            traits.methods.push(TraitMethod {
+                                signature: signature.clone(),
+                                is_public,
+                                is_final: is_final_method,
+                                is_abstract: is_abstract_method,
+                            });
+                        }
+                        if is_public && !is_final_method {
+                            public_methods.push(signature);
+                        } else {
+                            traits.hidden_methods.push(signature.name);
+                        }
+                    } else {
+                        traits.hidden_methods.push(method_name);
                     }
                 }
             }
@@ -178,6 +208,7 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
         is_abstract,
         is_final,
         public_methods,
+        traits: Box::new(traits),
     }))
 }
 

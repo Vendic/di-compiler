@@ -268,6 +268,8 @@ fn collect_public_methods_with_inheritance(
                 result.push(method.clone());
             }
         }
+        // A final or non-public method here means the parent's version is not what callers get.
+        seen.extend(info.traits.hidden_methods.iter().cloned());
         cursor = info.extends.clone();
     }
 
@@ -450,6 +452,7 @@ mod tests {
             is_abstract: false,
             is_final,
             public_methods: vec![],
+            traits: Default::default(),
         }
     }
 

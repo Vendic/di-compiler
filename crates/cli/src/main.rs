@@ -49,6 +49,7 @@ use di_xml_reader::{
 use php_extractor::{
     extract_file, extract_file_with_class_check, extract_string_constants,
     is_plain_literal_default,
+    traits::apply_traits,
     types::{
         ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
         MethodSignature,
@@ -539,13 +540,14 @@ fn main() {
     pb.finish_with_message("done");
 
     // Not compiled, but enabled code can still name these classes or extend them.
-    let disabled_class_map: FxHashMap<String, ClassInfo> = walk_php_files(&disabled_module_paths)
-        .par_iter()
-        .filter_map(|path| match extract_file(path) {
-            ExtractResult::Ok(info) => Some((info.fqcn.clone(), info)),
-            _ => None,
-        })
-        .collect();
+    let mut disabled_class_map: FxHashMap<String, ClassInfo> =
+        walk_php_files(&disabled_module_paths)
+            .par_iter()
+            .filter_map(|path| match extract_file(path) {
+                ExtractResult::Ok(info) => Some((info.fqcn.clone(), info)),
+                _ => None,
+            })
+            .collect();
 
     let classes_asked_for_by_files = run_file_level_checks(
         &mut class_map,
@@ -553,6 +555,20 @@ fn main() {
         &magento_root,
         &args.fallback_php,
     );
+
+    let composer_autoload = ComposerAutoloadIndex::from_magento_root(&magento_root);
+    apply_traits(&mut class_map, &|name| {
+        disabled_class_map
+            .get(name)
+            .cloned()
+            .or_else(|| composer_class_info(composer_autoload.as_ref(), name))
+    });
+    apply_traits(&mut disabled_class_map, &|name| {
+        class_map
+            .get(name)
+            .cloned()
+            .or_else(|| composer_class_info(composer_autoload.as_ref(), name))
+    });
 
     let fallbacks = fallback_count.load(std::sync::atomic::Ordering::Relaxed);
     let failures = failure_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -714,7 +730,6 @@ fn main() {
     // Phase 4: Detection (uses full_di_config = all areas merged)
     // -----------------------------------------------------------------------
     let phase_4_started = Instant::now();
-    let composer_autoload = ComposerAutoloadIndex::from_magento_root(&magento_root);
     let mut proxy_targets = collect_proxy_targets_from_di_configs(&scanner_di_configs);
     proxy_targets.extend(proxy_targets_from_constructors(&class_map));
     let mut extra_existing_proxy_targets: FxHashSet<String> = FxHashSet::default();
@@ -845,6 +860,9 @@ fn main() {
         composer_autoload.as_ref(),
         &disabled_class_map,
     );
+    apply_traits(&mut interception_class_map, &|name| {
+        composer_class_info(composer_autoload.as_ref(), name)
+    });
     for spec in &factories {
         if interception_class_map.contains_key(&spec.factory_fqcn) {
             continue;
@@ -1637,6 +1655,9 @@ fn main() {
             &full_di_config,
             composer_autoload.as_ref(),
         );
+        apply_traits(&mut plugin_list_class_map, &|name| {
+            composer_class_info(composer_autoload.as_ref(), name)
+        });
         let plugin_scopes = [
             "global",
             "adminhtml",
@@ -3233,6 +3254,7 @@ fn synthetic_reflected_class_info(fqcn: &str, params: Vec<ConstructorParam>) -> 
         is_abstract: false,
         is_final: false,
         public_methods: vec![],
+        traits: Default::default(),
     }
 }
 
@@ -4399,6 +4421,7 @@ fn synthetic_factory_class_info(factory_fqcn: &str) -> ClassInfo {
             is_static: false,
             returns_reference: false,
         }],
+        traits: Default::default(),
     }
 }
 
@@ -4574,6 +4597,13 @@ fn merge_plugins_for_interception(
     out
 }
 
+fn composer_class_info(index: Option<&ComposerAutoloadIndex>, fqcn: &str) -> Option<ClassInfo> {
+    match extract_file(&index?.resolve_class_path(fqcn)?) {
+        ExtractResult::Ok(info) => Some(info),
+        _ => None,
+    }
+}
+
 fn augment_with_composer_plugin_owner_classes(
     class_map: &mut FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
@@ -4731,6 +4761,8 @@ fn collect_public_methods_with_inheritance(
                 methods.push(method.clone());
             }
         }
+        // A final or non-public method here means the parent's version is not what callers get.
+        seen_names.extend(info.traits.hidden_methods.iter().cloned());
 
         if let Some(parent) = &info.extends {
             stack.push(parent.clone());
@@ -5456,6 +5488,7 @@ fn synthetic_search_results_class_info(spec: &SearchResultsSpec) -> ClassInfo {
             is_static: false,
             returns_reference: false,
         }],
+        traits: Default::default(),
     }
 }
 
@@ -5481,6 +5514,7 @@ fn synthetic_proxy_deferred_class_info(spec: &ProxyDeferredSpec) -> ClassInfo {
         is_abstract: false,
         is_final: false,
         public_methods: vec![],
+        traits: Default::default(),
     }
 }
 
@@ -5504,6 +5538,7 @@ fn synthetic_proxy_target_info(target_fqcn: &str, kind: ClassKind) -> ClassInfo 
         is_abstract: false,
         is_final: false,
         public_methods: vec![],
+        traits: Default::default(),
     }
 }
 
@@ -6312,6 +6347,7 @@ mod tests {
             is_abstract,
             is_final: false,
             public_methods: vec![],
+            traits: Default::default(),
         }
     }
 
@@ -6390,6 +6426,7 @@ mod tests {
             is_abstract: false,
             is_final: false,
             public_methods: vec![],
+            traits: Default::default(),
         };
         class_map.insert("Child".to_string(), child);
         let mut di_config = DiConfig::default();
