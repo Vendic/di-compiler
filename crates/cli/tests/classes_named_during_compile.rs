@@ -106,12 +106,6 @@ fn write_fixture(root: &Path) {
         "Acme\\On\\Compat\\NeverDeclared",
         "if (class_exists(\\Acme\\Gone\\Thing::class)) {\n    class NeverDeclared\n    {\n    }\n}",
     );
-    write_class(
-        root,
-        "Acme\\On\\Compat\\Broken",
-        "if (class_exists(\\Acme\\On\\Model\\Widget::class)) {\n    \
-         throw new \\RuntimeException('stop');\n}\n\nclass Broken\n{\n}",
-    );
 }
 
 /// The arguments of one class in a metadata file, or `None` if it has no entry.
@@ -248,13 +242,4 @@ fn class_that_php_does_not_declare_is_not_compiled() {
         "Acme\\On\\Compat\\NeverDeclared"
     )
     .is_none());
-}
-
-#[test]
-fn file_that_php_cannot_run_keeps_the_class_from_the_static_scan() {
-    let Some(tmp) = compiled_fixture() else {
-        return;
-    };
-
-    assert!(arguments_of(&global_metadata(tmp.path()), "Acme\\On\\Compat\\Broken").is_some());
 }

@@ -25,8 +25,10 @@ use quick_xml::Reader;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+mod class_checks;
 mod di_xml_checks;
 mod file_level_checks;
+use class_checks::{ClassChecks, ScannedFile};
 use di_xml_checks::DiXmlCheck;
 use file_level_checks::run_file_level_checks;
 
@@ -544,6 +546,13 @@ fn main() {
     let _cache_ref = &cache;
 
     let file_level_checks = Mutex::new(Vec::new());
+    let scanned_files = Mutex::new(Vec::with_capacity(php_files.len()));
+    let scanned = |class: &str, path: &Path| {
+        scanned_files.lock().unwrap().push(ScannedFile {
+            class: class.to_string(),
+            path: path.to_path_buf(),
+        });
+    };
     let mut class_map: FxHashMap<String, ClassInfo> = php_files
         .par_iter()
         .filter_map(|path| {
@@ -551,6 +560,7 @@ fn main() {
             pb.inc(1);
             match result {
                 ExtractResult::Ok(info) => {
+                    scanned(&info.fqcn, path);
                     if has_class_check {
                         file_level_checks
                             .lock()
@@ -561,16 +571,19 @@ fn main() {
                 }
                 ExtractResult::NoClass => None,
                 ExtractResult::PhpFallbackFailed(e) => {
+                    scanned("", path);
                     fallback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!("Fallback failed for {}: {}", path.display(), e);
                     None
                 }
                 ExtractResult::LexError(e) => {
+                    scanned("", path);
                     failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!("Lex error for {}: {e}", path.display());
                     None
                 }
                 ExtractResult::ParseFailure(e) => {
+                    scanned("", path);
                     failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!("Parse failure for {}: {}", path.display(), e);
                     None
@@ -579,6 +592,13 @@ fn main() {
         })
         .collect();
     pb.finish_with_message("done");
+    let class_checks = ClassChecks::start(
+        scanned_files.into_inner().unwrap(),
+        &magento_root,
+        &code_root,
+        &args.fallback_php,
+        rayon::current_num_threads(),
+    );
 
     // Not compiled, but enabled code can still name these classes or extend them.
     let mut disabled_class_map: FxHashMap<String, ClassInfo> =
@@ -1048,6 +1068,10 @@ fn main() {
     }
 
     if args.dry_run {
+        if let Err(message) = class_checks.finish() {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
         log::info!("Dry run — skipping file writes");
         print_summary(
             &interceptors,
@@ -1294,6 +1318,12 @@ fn main() {
     });
     pb.finish_with_message("done");
     log_phase_elapsed("Phase 6", phase_6_started);
+
+    // Generated code is on disk now, so a failure can be checked against the real classes.
+    if let Err(message) = class_checks.finish() {
+        eprintln!("error: {message}");
+        std::process::exit(1);
+    }
 
     // -----------------------------------------------------------------------
     // Phase 7: Generate metadata files
