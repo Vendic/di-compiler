@@ -733,6 +733,8 @@ fn main() {
         .into_iter()
         .map(|(_, c)| folded(c))
         .collect();
+    let area_names = compiled_areas(&di_config);
+    let areas: Vec<&str> = area_names.iter().map(String::as_str).collect();
     // HashSet for O(1) membership tests — used in Phase 3b and Phase 7 filters.
     let di_xml_files_set: FxHashSet<&PathBuf> = di_xml_files.iter().collect();
     log_phase_elapsed("Phase 3a", phase_3a_started);
@@ -745,7 +747,7 @@ fn main() {
     // -----------------------------------------------------------------------
     let phase_3b_started = Instant::now();
     let all_di_xml_files = filter_enabled_di_xml(
-        find_all_di_xml_files(&magento_root, &enabled_modules),
+        find_all_di_xml_files(&magento_root, &enabled_modules, &areas),
         &enabled_modules,
         &magento_root,
     );
@@ -1406,25 +1408,15 @@ fn main() {
         .map(|b| b == new_fp)
         .unwrap_or(false);
     // On hit, verify all expected metadata files exist before skipping.
-    let plugin_scopes_for_fp = [
-        "global",
-        "adminhtml",
-        "crontab",
-        "frontend",
-        "graphql",
-        "webapi_rest",
-        "webapi_soap",
-    ];
-    let plugin_list_ids =
-        plugin_list_cache_ids(&magento_root, &args.fallback_php, &plugin_scopes_for_fp);
+    let plugin_list_ids = plugin_list_cache_ids(&magento_root, &args.fallback_php, &areas);
     let fp_hit = fp_hit && {
-        AREAS
+        areas
             .iter()
             .map(|a| metadata_root.join(format!("{}.php", a)))
             .chain(std::iter::once(metadata_root.join("interception.php")))
             .chain(std::iter::once(metadata_root.join("app_action_list.php")))
             .chain(
-                plugin_scopes_for_fp
+                areas
                     .iter()
                     .map(|s| metadata_root.join(format!("{}.php", plugin_list_ids[*s]))),
             )
@@ -1609,8 +1601,8 @@ fn main() {
         // Per-area config files — each area merges global + area-specific di.xml overlays.
         // Run in parallel: each area is independent (different files, different output path).
         let t_area_config = Instant::now();
-        let pb_area = progress_bar(AREAS.len() as u64, "Generating area configs");
-        let area_di_configs: FxHashMap<String, std::sync::Arc<DiConfig>> = AREAS
+        let pb_area = progress_bar(areas.len() as u64, "Generating area configs");
+        let area_di_configs: FxHashMap<String, std::sync::Arc<DiConfig>> = areas
             .par_iter()
             .map(|&area| {
                 let area_di_files = filter_enabled_di_xml(
@@ -1760,7 +1752,7 @@ fn main() {
         pb_area.finish_with_message("done");
         log_phase_elapsed("Phase 7 area-config loop", t_area_config);
         if let Err(message) =
-            check_preference_targets(&area_di_configs, &class_map, &generated_class_map)
+            check_preference_targets(&areas, &area_di_configs, &class_map, &generated_class_map)
         {
             stop_compile(&message);
         }
@@ -1784,23 +1776,11 @@ fn main() {
         apply_traits(&mut plugin_list_class_map, &|name| {
             composer_class_info(composer_autoload.as_ref(), name)
         });
-        let plugin_scopes = [
-            "global",
-            "adminhtml",
-            "crontab",
-            "frontend",
-            "graphql",
-            "webapi_rest",
-            "webapi_soap",
-        ];
         let t_plugin_list = Instant::now();
-        let pb_plugins = progress_bar(
-            plugin_scopes.len() as u64,
-            "Generating plugin-list metadata",
-        );
+        let pb_plugins = progress_bar(areas.len() as u64, "Generating plugin-list metadata");
         let unconfirmed_plugin_classes = Mutex::new(std::collections::BTreeSet::new());
         let disabled_plugin_classes = Mutex::new(std::collections::BTreeSet::new());
-        plugin_scopes.par_iter().for_each(|&scope| {
+        areas.par_iter().for_each(|&scope| {
             if let Some(scope_di_config) = area_di_configs.get(scope) {
                 // A scope with no di.xml of its own has the global config here, but loads
                 // no virtual types.
@@ -2103,14 +2083,14 @@ fn generated_class_source_exists(class: &str, source_exists: &impl Fn(&str) -> b
 /// list of known classes grows per area, because `fillThirdPartyInterfaces()` adds the classes
 /// that have a preference. So an area can pass thanks to an earlier one, and the order counts.
 fn check_preference_targets(
+    compiled_areas: &[&str],
     area_di_configs: &FxHashMap<String, std::sync::Arc<DiConfig>>,
     class_map: &FxHashMap<String, ClassInfo>,
     generated_class_map: &FxHashMap<String, ClassInfo>,
 ) -> Result<(), String> {
     let mut known_with_preference: FxHashSet<&str> = FxHashSet::default();
     let mut answers: FxHashMap<String, Option<String>> = FxHashMap::default();
-    let areas = std::iter::once("global").chain(AREAS.iter().copied().filter(|a| *a != "global"));
-    for area in areas {
+    for area in compiled_areas.iter().copied() {
         let Some(config) = area_di_configs.get(area) else {
             continue;
         };
@@ -5879,6 +5859,37 @@ fn merge_global_di_configs(configs: &[(PathBuf, DiConfig)], magento_root: &Path)
 /// TKT-051: explicit denylist prevents accidental inclusion of testing frameworks
 /// that may have a `registration.php` but are not production Magento modules.
 const EXCLUDED_PACKAGES: &[&str] = &["magento2-functional-testing-framework", "mftf"];
+
+/// The areas Magento compiles, with `global` first: `Operation\\Area::doOperation()` takes
+/// `AreaList::getCodes()`, the keys of the merged `areas` argument. A module can add one there.
+/// The standard names stay as a minimum.
+fn compiled_areas(di_config: &DiConfig) -> Vec<String> {
+    let mut areas: Vec<String> = AREAS.iter().map(|area| area.to_string()).collect();
+    let listed = di_config
+        .type_configs
+        .get("Magento\\Framework\\App\\AreaList")
+        .into_iter()
+        .flat_map(|config| &config.arguments)
+        .filter_map(|argument| match argument {
+            Argument::Array { name, items, .. } if name == "areas" => Some(items),
+            _ => None,
+        })
+        .flatten();
+    for item in listed {
+        let (Argument::Object { name, .. }
+        | Argument::String { name, .. }
+        | Argument::Boolean { name, .. }
+        | Argument::Number { name, .. }
+        | Argument::Null { name, .. }
+        | Argument::Array { name, .. }
+        | Argument::Init { name, .. }
+        | Argument::Const { name, .. }) = item;
+        if !areas.iter().any(|area| area == name) {
+            areas.push(name.clone());
+        }
+    }
+    areas
+}
 
 /// Split the discovered paths into what the compiler scans and disabled modules.
 ///

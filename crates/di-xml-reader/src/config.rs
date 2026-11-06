@@ -171,16 +171,8 @@ pub fn find_di_xml_files_for_area(
 pub fn find_all_di_xml_files(
     magento_root: &std::path::Path,
     module_order: &FxHashMap<String, usize>,
+    areas: &[&str],
 ) -> Vec<std::path::PathBuf> {
-    const AREAS: &[&str] = &[
-        "global",
-        "frontend",
-        "adminhtml",
-        "crontab",
-        "webapi_rest",
-        "webapi_soap",
-        "graphql",
-    ];
     let mut seen = FxHashSet::default();
     let mut result = Vec::new();
     // Global first
@@ -190,7 +182,7 @@ pub fn find_all_di_xml_files(
         }
     }
     // Then each area overlay
-    for area in AREAS {
+    for area in areas {
         for p in collect_di_xml_files(magento_root, Some(area), module_order) {
             if seen.insert(p.clone()) {
                 result.push(p);
