@@ -7,7 +7,7 @@ pub mod types;
 pub mod walker;
 
 pub use constants::extract_string_constants;
-pub use extractor::extract_file;
+pub use extractor::{extract_file, extract_file_with_class_check};
 pub use types::{
     ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodSignature,
 };
