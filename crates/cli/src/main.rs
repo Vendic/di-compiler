@@ -978,6 +978,19 @@ fn main() {
         .map(|spec| spec.factory_fqcn.clone())
         .collect();
     for ext in &extension_specs {
+        // A node without attributes on an interface that does not use extension attributes
+        // only gives the two classes that `ServiceDataAttributesScanner` lists.
+        let used = !ext.attributes.is_empty()
+            || class_map
+                .get(&ext.source_interface_fqcn)
+                .is_some_and(|info| {
+                    info.public_methods
+                        .iter()
+                        .any(|method| method.name == "getExtensionAttributes")
+                });
+        if !used {
+            continue;
+        }
         let factory_fqcn = format!("{}Factory", ext.extension_class_fqcn);
         if class_map.contains_key(&factory_fqcn) || !factory_seen.insert(factory_fqcn.clone()) {
             continue;
@@ -6204,6 +6217,9 @@ fn parse_extension_attributes_files(
                     if local_name(e.name().as_ref()) == "extension_attributes" {
                         current_for = event_attr(e, b"for")
                             .map(|v| v.trim().trim_start_matches('\\').to_string());
+                        if let Some(source_interface) = &current_for {
+                            out.entry(source_interface.clone()).or_default();
+                        }
                     } else if local_name(e.name().as_ref()) == "attribute" {
                         maybe_collect_extension_attribute(e, current_for.as_deref(), &mut out);
                     }
@@ -6211,6 +6227,12 @@ fn parse_extension_attributes_files(
                 Ok(Event::Empty(ref e)) => {
                     if local_name(e.name().as_ref()) == "attribute" {
                         maybe_collect_extension_attribute(e, current_for.as_deref(), &mut out);
+                    } else if local_name(e.name().as_ref()) == "extension_attributes" {
+                        // `ServiceDataAttributesScanner` takes the `for` of an empty node too.
+                        if let Some(source_interface) = event_attr(e, b"for") {
+                            out.entry(source_interface.trim().trim_start_matches('\\').to_string())
+                                .or_default();
+                        }
                     }
                 }
                 Ok(Event::End(ref e)) => {
