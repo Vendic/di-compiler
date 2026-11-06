@@ -303,7 +303,7 @@ fn derive_intercepted_methods_from_plugins(
     methods
 }
 
-fn derive_intercepted_methods_from_ancestor_plugins(
+pub fn derive_intercepted_methods_from_ancestor_plugins(
     fqcn: &str,
     class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
