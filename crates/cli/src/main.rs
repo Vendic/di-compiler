@@ -6120,7 +6120,7 @@ mod tests {
                <type name="Foo\Baz"><plugin name="y" sortOrder="5"/></type>"#,
         )];
 
-        let merged = merge_plugins_for_interception(&global, &area);
+        let merged = crate::merge_plugins_for_interception(&global, &area);
 
         assert!(merged["Foo\\Bar"][0].is_active());
         assert_eq!(merged["Foo\\Bar"][0].sort_order, Some(10));
