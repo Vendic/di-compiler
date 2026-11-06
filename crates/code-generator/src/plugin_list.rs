@@ -679,6 +679,7 @@ mod tests {
             is_abstract: false,
             is_final: false,
             public_methods: methods.iter().map(|m| method(m)).collect(),
+            traits: Default::default(),
         }
     }
 

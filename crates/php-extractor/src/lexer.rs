@@ -7,6 +7,7 @@ use std::path::Path;
 
 use crate::types::{
     ClassInfo, ClassKind, Constructor, ConstructorParam, LexError, MethodParam, MethodSignature,
+    TraitData, TraitMethod, TraitRule,
 };
 
 pub struct Lexer;
@@ -37,6 +38,21 @@ impl Lexer {
             .nth(line.saturating_sub(2))
             .map_or(0, |(at, _)| at + 1);
         s.extract_class(path)
+    }
+
+    /// Reads the text of one trait `use` statement, for the tree-sitter tier.
+    pub(crate) fn read_trait_use_text(
+        text: &str,
+        namespace: &str,
+        use_map: &rustc_hash::FxHashMap<String, String>,
+        traits: &mut TraitData,
+    ) -> Result<(), LexError> {
+        let mut s = Scanner::new(text.as_bytes());
+        s.namespace = namespace.to_string();
+        s.use_map = use_map.clone();
+        s.skip_noise();
+        s.read_word();
+        s.read_trait_use(traits)
     }
 }
 
@@ -358,7 +374,8 @@ impl<'a> Scanner<'a> {
             format!("{}\\{}", namespace, name)
         };
 
-        let (constructor, public_methods) = self.parse_class_body()?;
+        let (constructor, public_methods, traits) =
+            self.parse_class_body(matches!(kind, ClassKind::Trait))?;
 
         Ok(ClassInfo {
             path: path.to_path_buf(),
@@ -372,6 +389,7 @@ impl<'a> Scanner<'a> {
             is_abstract,
             is_final,
             public_methods,
+            traits: Box::new(traits),
         })
     }
 
@@ -670,11 +688,111 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
+    /// `use A, B;` or `use A, B { A::run insteadof B; B::run as walk; }`. The keyword is read.
+    fn read_trait_use(&mut self, traits: &mut TraitData) -> Result<(), LexError> {
+        self.read_fqn_list(&mut traits.uses)?;
+        self.skip_noise();
+        if self.peek() != b'{' {
+            self.skip_to_semicolon();
+            return Ok(());
+        }
+        self.advance(1);
+        loop {
+            self.skip_noise();
+            if self.is_eof() {
+                return Err(LexError::UnexpectedEof);
+            }
+            match self.peek() {
+                b'}' => {
+                    self.advance(1);
+                    return Ok(());
+                }
+                b';' => self.advance(1),
+                _ => self.read_trait_rule(traits)?,
+            }
+        }
+    }
+
+    fn read_trait_rule(&mut self, traits: &mut TraitData) -> Result<(), LexError> {
+        let absolute = self.peek() == b'\\';
+        let mut name = String::new();
+        loop {
+            let b = self.peek();
+            if is_word_char(b) {
+                name.push_str(std::str::from_utf8(self.read_word()).unwrap_or(""));
+            } else if b == b'\\' {
+                name.push('\\');
+                self.advance(1);
+            } else {
+                break;
+            }
+        }
+        self.skip_noise();
+        let (trait_name, method) = if self.peek() == b':' && self.at(1) == b':' {
+            self.advance(2);
+            self.skip_noise();
+            let method = std::str::from_utf8(self.read_word())
+                .unwrap_or("")
+                .to_string();
+            let name = name.trim_start_matches('\\');
+            let trait_name = if absolute {
+                name.to_string()
+            } else {
+                self.resolve_type(name)
+            };
+            (Some(trait_name), method)
+        } else {
+            (None, name)
+        };
+
+        self.skip_noise();
+        if !is_word_start(self.peek()) {
+            return Err(LexError::Unsupported("trait_rule".into()));
+        }
+        let keyword = self.read_word();
+        if keyword.eq_ignore_ascii_case(b"insteadof") {
+            let mut excluded = Vec::new();
+            self.read_fqn_list(&mut excluded)?;
+            traits.rules.push(TraitRule::InsteadOf { method, excluded });
+            return Ok(());
+        }
+        if !keyword.eq_ignore_ascii_case(b"as") {
+            return Err(LexError::Unsupported("trait_rule".into()));
+        }
+
+        let mut alias = None;
+        let mut is_public = None;
+        let mut is_final = false;
+        loop {
+            self.skip_noise();
+            if !is_word_start(self.peek()) {
+                break;
+            }
+            let word = self.read_word();
+            match word.to_ascii_lowercase().as_slice() {
+                b"public" if alias.is_none() => is_public = Some(true),
+                b"protected" | b"private" if alias.is_none() => is_public = Some(false),
+                b"final" if alias.is_none() => is_final = true,
+                _ => alias = Some(std::str::from_utf8(word).unwrap_or("").to_string()),
+            }
+        }
+        traits.rules.push(TraitRule::Alias {
+            trait_name,
+            method,
+            alias,
+            is_public,
+            is_final,
+        });
+        Ok(())
+    }
+
     fn parse_class_body(
         &mut self,
-    ) -> Result<(Option<Constructor>, Vec<MethodSignature>), LexError> {
+        is_trait: bool,
+    ) -> Result<(Option<Constructor>, Vec<MethodSignature>, TraitData), LexError> {
         let mut constructor: Option<Constructor> = None;
         let mut public_methods: Vec<MethodSignature> = Vec::new();
+        let mut traits = TraitData::default();
         let mut depth: u32 = 1;
 
         loop {
@@ -755,6 +873,10 @@ impl<'a> Scanner<'a> {
             let mut saw_function = false;
 
             let first_word = self.read_word();
+            if first_word.eq_ignore_ascii_case(b"use") {
+                self.read_trait_use(&mut traits)?;
+                continue;
+            }
             let is_modifier = matches!(
                 first_word.to_ascii_lowercase().as_slice(),
                 b"abstract"
@@ -824,7 +946,10 @@ impl<'a> Scanner<'a> {
 
             if method_name.eq_ignore_ascii_case("__construct") {
                 let params = self.parse_param_list()?;
-                constructor = Some(Constructor { params });
+                // An abstract constructor in a trait only asks for one. It is not one.
+                if !(is_trait && is_abstract_method) {
+                    constructor = Some(Constructor { params });
+                }
                 self.skip_noise();
                 if self.peek() == b':' {
                     self.advance(1);
@@ -832,7 +957,7 @@ impl<'a> Scanner<'a> {
                     self.skip_type_hint()?;
                 }
                 self.skip_method_body_braces(&mut depth);
-            } else if is_public && !is_final_method {
+            } else if is_trait || (is_public && !is_final_method) {
                 let params = self.parse_method_params()?;
                 self.skip_noise();
                 let return_type = if self.peek() == b':' {
@@ -843,15 +968,28 @@ impl<'a> Scanner<'a> {
                     None
                 };
                 self.skip_method_body_braces(&mut depth);
-                let _ = is_abstract_method;
-                public_methods.push(MethodSignature {
+                let signature = MethodSignature {
                     name: method_name,
                     params,
                     return_type,
                     is_static,
                     returns_reference,
-                });
+                };
+                if is_trait {
+                    traits.methods.push(TraitMethod {
+                        signature: signature.clone(),
+                        is_public,
+                        is_final: is_final_method,
+                        is_abstract: is_abstract_method,
+                    });
+                }
+                if is_public && !is_final_method {
+                    public_methods.push(signature);
+                } else {
+                    traits.hidden_methods.push(signature.name);
+                }
             } else {
+                traits.hidden_methods.push(method_name);
                 self.skip_to_matching_paren();
                 self.skip_noise();
                 if self.peek() == b':' {
@@ -863,7 +1001,7 @@ impl<'a> Scanner<'a> {
             }
         }
 
-        Ok((constructor, public_methods))
+        Ok((constructor, public_methods, traits))
     }
 
     fn skip_to_stmt_end(&mut self, depth: &mut u32) {
