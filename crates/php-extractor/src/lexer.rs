@@ -905,30 +905,30 @@ impl<'a> Scanner<'a> {
         Ok(params)
     }
 
-    fn parse_one_ctor_param(&mut self) -> Result<Option<ConstructorParam>, LexError> {
-        self.skip_noise();
-        let mut is_promoted = false;
-        let mut is_readonly = false;
-
-        if is_word_start(self.peek()) {
+    /// Skips promotion modifiers, which PHP accepts in any order and any case.
+    /// Returns whether there was at least one. `Private\Foo` is a type, not a modifier.
+    fn skip_param_modifiers(&mut self) -> bool {
+        let mut found = false;
+        loop {
+            self.skip_noise();
+            if !is_word_start(self.peek()) {
+                return found;
+            }
             let saved = self.pos;
             let word = self.read_word();
-            match word {
-                b"public" | b"private" | b"protected" => {
-                    is_promoted = true;
-                    self.skip_noise();
-                    if self.peek_word_eq(b"readonly") {
-                        self.read_word();
-                        is_readonly = true;
-                    }
-                }
-                word if word.eq_ignore_ascii_case(b"readonly") => {
-                    is_readonly = true;
-                }
-                _ => self.pos = saved,
+            let is_modifier = [&b"public"[..], b"private", b"protected", b"readonly"]
+                .iter()
+                .any(|modifier| word.eq_ignore_ascii_case(modifier));
+            if !is_modifier || self.peek() == b'\\' {
+                self.pos = saved;
+                return found;
             }
+            found = true;
         }
-        let _ = is_readonly;
+    }
+
+    fn parse_one_ctor_param(&mut self) -> Result<Option<ConstructorParam>, LexError> {
+        let is_promoted = self.skip_param_modifiers();
 
         let type_hint = self.try_read_type_hint()?;
 
@@ -981,15 +981,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn parse_one_method_param(&mut self) -> Result<Option<MethodParam>, LexError> {
-        self.skip_noise();
-        if is_word_start(self.peek()) {
-            let saved = self.pos;
-            let word = self.read_word();
-            match word {
-                b"public" | b"private" | b"protected" | b"readonly" => {}
-                _ => self.pos = saved,
-            }
-        }
+        self.skip_param_modifiers();
         let type_hint = self.try_read_type_hint()?;
 
         self.skip_noise();
@@ -1473,6 +1465,74 @@ class Bar {
         assert_eq!(ctor.params.len(), 2);
         assert!(ctor.params[0].is_promoted);
         assert!(ctor.params[1].is_promoted);
+    }
+
+    #[test]
+    fn test_constructor_modifiers_in_any_order() {
+        for modifiers in [
+            "readonly private",
+            "private readonly",
+            "readonly protected",
+            "readonly public",
+            "READONLY PRIVATE",
+            "readonly /* comment */ private",
+            "readonly",
+            "private",
+        ] {
+            let php = format!(
+                "<?php\nnamespace Foo;\nclass A {{\n    public function __construct({modifiers} Bar $x, int $y = 1) {{}}\n}}"
+            );
+            let info = extract_str(&php).unwrap();
+            let ctor = info.constructor.unwrap();
+            assert_eq!(ctor.params.len(), 2, "{modifiers}");
+            assert_eq!(ctor.params[0].name, "x", "{modifiers}");
+            assert_eq!(
+                ctor.params[0].type_hint.as_deref(),
+                Some("Foo\\Bar"),
+                "{modifiers}"
+            );
+            assert!(ctor.params[0].is_promoted, "{modifiers}");
+            assert!(!ctor.params[1].is_promoted, "{modifiers}");
+        }
+    }
+
+    #[test]
+    fn test_type_with_a_modifier_as_namespace_segment_is_not_a_modifier() {
+        let php = "<?php\nnamespace Foo;\nclass A {\n    public function __construct(Private\\Bar $x, public Readonly\\Baz $y) {}\n}";
+        let ctor = extract_str(php).unwrap().constructor.unwrap();
+        assert_eq!(
+            ctor.params[0].type_hint.as_deref(),
+            Some("Foo\\Private\\Bar")
+        );
+        assert!(!ctor.params[0].is_promoted);
+        assert_eq!(
+            ctor.params[1].type_hint.as_deref(),
+            Some("Foo\\Readonly\\Baz")
+        );
+        assert!(ctor.params[1].is_promoted);
+    }
+
+    #[test]
+    fn test_method_params_with_modifiers_in_any_order() {
+        for modifiers in [
+            "readonly private",
+            "private readonly",
+            "readonly",
+            "private",
+        ] {
+            let php = format!(
+                "<?php\nnamespace Foo;\nclass A {{\n    public function run({modifiers} Bar $x) {{}}\n}}"
+            );
+            let info = extract_str(&php).unwrap();
+            let params = &info.public_methods[0].params;
+            assert_eq!(params.len(), 1, "{modifiers}");
+            assert_eq!(params[0].name, "x", "{modifiers}");
+            assert_eq!(
+                params[0].type_hint.as_deref(),
+                Some("Foo\\Bar"),
+                "{modifiers}"
+            );
+        }
     }
 
     #[test]
