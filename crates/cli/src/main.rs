@@ -1064,15 +1064,23 @@ fn main() {
     // inheritance from e.g. Symfony\Console\Command\Command). However, if a Setup
     // class has a *direct* plugin declared in di.xml, PHP does generate its interceptor
     // (e.g. Magento\Setup\Model\FixtureGenerator\EntityGeneratorFactory). Keep those.
+    let setup_root = magento_root.join("setup");
+    let parents_of_scanned_classes = scanned_parents_outside(&class_map, &setup_root);
     interceptors.retain(|spec| {
         let fqcn = spec.fqcn.trim_start_matches('\\');
         if !fqcn.starts_with("Magento\\Setup\\") {
             return true; // non-Setup class — always keep
         }
-        !spec.plugins.is_empty() // Setup class with direct plugins — keep; inherited-only — drop
+        if spec.plugins.is_empty() {
+            return false; // inherited-only — drop
+        }
+        // `intercepted_paths` has no `setup/src`, so only a child on those paths reaches this class.
+        class_map
+            .get(fqcn)
+            .is_none_or(|info| !info.path.starts_with(&setup_root))
+            || parents_of_scanned_classes.contains(fqcn)
     });
     // The generated interceptor of a readonly class is a fatal error when Magento loads it.
-    let setup_root = magento_root.join("setup");
     let mut readonly_classes: Vec<&str> = interceptors
         .par_iter()
         .filter(|spec| {
@@ -6010,6 +6018,32 @@ fn compiled_areas(di_config: &DiConfig) -> Vec<String> {
         }
     }
     areas
+}
+
+/// The parents, at any level, of the classes outside `folder`.
+fn scanned_parents_outside<'a>(
+    class_map: &'a FxHashMap<String, ClassInfo>,
+    folder: &Path,
+) -> FxHashSet<&'a str> {
+    let mut parents = FxHashSet::default();
+    for info in class_map.values() {
+        if info.path.starts_with(folder) {
+            continue;
+        }
+        let mut current = info;
+        while let Some((name, parent)) = current
+            .extends
+            .as_deref()
+            .map(|name| name.trim_start_matches('\\'))
+            .and_then(|name| class_map.get(name).map(|parent| (name, parent)))
+        {
+            if !parents.insert(name) {
+                break;
+            }
+            current = parent;
+        }
+    }
+    parents
 }
 
 /// Split the discovered paths into what the compiler scans and disabled modules.
