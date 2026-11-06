@@ -218,6 +218,22 @@ function tstr($t): ?string {
     }
     return null;
 }
+function resolve_name(string $name, ReflectionClass $declaring): string {
+    $lower = strtolower($name);
+    if ($lower === 'self') return $declaring->getName();
+    if ($lower === 'parent') { $p = $declaring->getParentClass(); return $p ? $p->getName() : $name; }
+    return $name;
+}
+function method_tstr($t, ReflectionClass $declaring): ?string {
+    if ($t === null) return null;
+    if ($t instanceof ReflectionNamedType) {
+        $name = resolve_name($t->getName(), $declaring);
+        if ($t->allowsNull() && $name !== 'mixed' && $name !== 'null') return '?' . $name;
+        return $name;
+    }
+    $parts = []; foreach ($t->getTypes() as $p) $parts[] = resolve_name($p->getName(), $declaring);
+    return implode($t instanceof ReflectionUnionType ? '|' : '&', $parts);
+}
 function reflect_methods(string $class): ?array {
     if (!class_exists($class) && !interface_exists($class) && !trait_exists($class)) return null;
     $ref = new ReflectionClass($class);
@@ -230,12 +246,12 @@ function reflect_methods(string $class): ?array {
         foreach ($m->getParameters() as $p) {
             $dv = null; $hd = $p->isDefaultValueAvailable() && !$p->isVariadic();
             if ($hd) { $dv = encode_default($p->getDefaultValue()); }
-            $params[] = ['name'=>$p->getName(),'type_hint'=>tstr($p->getType()),
+            $params[] = ['name'=>$p->getName(),'type_hint'=>method_tstr($p->getType(), $m->getDeclaringClass()),
                 'has_default'=>$hd,'default_value'=>$dv,
                 'is_variadic'=>$p->isVariadic(),'is_by_ref'=>$p->isPassedByReference()];
         }
         $rows[] = ['name'=>$name,'params'=>$params,
-            'return_type'=>tstr($m->getReturnType()),'returns_reference'=>$m->returnsReference()];
+            'return_type'=>method_tstr($m->getReturnType(), $m->getDeclaringClass()),'returns_reference'=>$m->returnsReference()];
     }
     return $rows;
 }
@@ -1125,11 +1141,7 @@ fn main() {
                         .iter()
                         .filter_map(|p| p.default_value.as_deref()),
                 );
-                normalize_reflected_method_signature_for_proxy(
-                    method,
-                    target_fqcn,
-                    &interception_class_map,
-                );
+                normalize_reflected_method_signature(method);
             }
             Some((target_fqcn.clone(), reflected_methods))
         })
@@ -4837,7 +4849,7 @@ fn enrich_interceptor_specs_with_reflection(
                     fqcn,
                     m.params.iter().filter_map(|p| p.default_value.as_deref()),
                 );
-                normalize_reflected_method_signature(m, fqcn, class_map);
+                normalize_reflected_method_signature(m);
             }
             Some((fqcn.clone(), methods))
         })
@@ -4888,7 +4900,7 @@ fn enrich_interceptor_specs_with_reflection(
 
         if !missing_expected {
             // Keep resolver-selected method set/order; normalise signatures
-            // from reflection (self→concrete, static→concrete, union order, defaults).
+            // from reflection (self→declaring class, union order, defaults).
             spec.public_methods = spec
                 .public_methods
                 .iter()
@@ -4980,18 +4992,26 @@ fn compute_expected_method_names(
     names
 }
 
+/// `self`, `parent` or `static`, also when nullable. PHP keywords ignore case.
+fn is_relative_type(type_name: &str) -> bool {
+    let core = type_name.trim_start_matches('?');
+    ["self", "parent", "static"]
+        .iter()
+        .any(|keyword| core.eq_ignore_ascii_case(keyword))
+}
+
 fn interceptor_methods_need_reflection_normalization(methods: &[MethodSignature]) -> bool {
     methods.iter().any(|method| {
         method
             .return_type
             .as_deref()
-            .map(|rt| matches!(rt, "self" | "parent" | "static") || rt.contains('|'))
+            .map(|rt| is_relative_type(rt) || rt.contains('|'))
             .unwrap_or(false)
             || method.params.iter().any(|param| {
                 param
                     .type_hint
                     .as_deref()
-                    .map(|th| matches!(th, "self" | "parent" | "static") || th.contains('|'))
+                    .map(|th| is_relative_type(th) || th.contains('|'))
                     .unwrap_or(false)
                     || param
                         .default_value
@@ -5004,41 +5024,20 @@ fn interceptor_methods_need_reflection_normalization(methods: &[MethodSignature]
     })
 }
 
-fn normalize_reflected_method_signature(
-    method: &mut MethodSignature,
-    target_fqcn: &str,
-    class_map: &FxHashMap<String, ClassInfo>,
-) {
+/// The PHP worker already resolved `self` and `parent` to the declaring class. Magento keeps
+/// `static`, because a class name in its place does not load.
+fn normalize_reflected_method_signature(method: &mut MethodSignature) {
     if let Some(rt) = method.return_type.as_mut() {
-        *rt = normalize_reflected_type_hint(rt, target_fqcn, class_map);
+        *rt = normalize_reflected_type_hint(rt);
     }
     for param in method.params.iter_mut() {
         if let Some(th) = param.type_hint.as_mut() {
-            *th = normalize_reflected_type_hint(th, target_fqcn, class_map);
+            *th = normalize_reflected_type_hint(th);
         }
     }
 }
 
-fn normalize_reflected_method_signature_for_proxy(
-    method: &mut MethodSignature,
-    target_fqcn: &str,
-    class_map: &FxHashMap<String, ClassInfo>,
-) {
-    if let Some(rt) = method.return_type.as_mut() {
-        *rt = normalize_reflected_type_hint_for_proxy(rt, target_fqcn, class_map);
-    }
-    for param in method.params.iter_mut() {
-        if let Some(th) = param.type_hint.as_mut() {
-            *th = normalize_reflected_type_hint_for_proxy(th, target_fqcn, class_map);
-        }
-    }
-}
-
-fn normalize_reflected_type_hint(
-    raw: &str,
-    target_fqcn: &str,
-    class_map: &FxHashMap<String, ClassInfo>,
-) -> String {
+fn normalize_reflected_type_hint(raw: &str) -> String {
     const BUILTIN_PRECEDENCE: &[(&str, u8)] = &[
         ("bool", 1),
         ("int", 2),
@@ -5057,93 +5056,13 @@ fn normalize_reflected_type_hint(
         ("never", 15),
     ];
 
-    let normalized_target = target_fqcn.trim_start_matches('\\');
-    let current_info = class_map.get(normalized_target);
-
     let (nullable, core) = if let Some(rest) = raw.strip_prefix('?') {
         ("?", rest)
     } else {
         ("", raw)
     };
 
-    let normalize_single = |part: &str| -> String {
-        match part {
-            "self" | "static" => normalized_target.to_string(),
-            "parent" => current_info
-                .and_then(|info| info.extends.clone())
-                .unwrap_or_else(|| "parent".to_string()),
-            _ => part.trim_start_matches('\\').to_string(),
-        }
-    };
-
-    if core.contains('|') {
-        let mut parts: Vec<String> = core
-            .split('|')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(normalize_single)
-            .collect();
-        let precedence_of = |value: &str| -> u8 {
-            let lower = value.to_ascii_lowercase();
-            BUILTIN_PRECEDENCE
-                .iter()
-                .find_map(|(name, rank)| (*name == lower).then_some(*rank))
-                .unwrap_or(0)
-        };
-        parts.sort_by(|a, b| {
-            precedence_of(a)
-                .cmp(&precedence_of(b))
-                .then_with(|| a.cmp(b))
-        });
-        return format!("{}{}", nullable, parts.join("|"));
-    }
-
-    format!("{}{}", nullable, normalize_single(core))
-}
-
-fn normalize_reflected_type_hint_for_proxy(
-    raw: &str,
-    target_fqcn: &str,
-    class_map: &FxHashMap<String, ClassInfo>,
-) -> String {
-    const BUILTIN_PRECEDENCE: &[(&str, u8)] = &[
-        ("bool", 1),
-        ("int", 2),
-        ("float", 3),
-        ("string", 4),
-        ("array", 5),
-        ("callable", 6),
-        ("iterable", 7),
-        ("object", 8),
-        ("static", 9),
-        ("mixed", 10),
-        ("void", 11),
-        ("false", 12),
-        ("true", 13),
-        ("null", 14),
-        ("never", 15),
-    ];
-
-    let normalized_target = target_fqcn.trim_start_matches('\\');
-    let current_info = class_map.get(normalized_target);
-
-    let (nullable, core) = if let Some(rest) = raw.strip_prefix('?') {
-        ("?", rest)
-    } else {
-        ("", raw)
-    };
-
-    let normalize_single = |part: &str| -> String {
-        match part {
-            // Keep proxy parity with Magento: `self` resolves to concrete target
-            // class name, while `static` remains `static`.
-            "self" => normalized_target.to_string(),
-            "parent" => current_info
-                .and_then(|info| info.extends.clone())
-                .unwrap_or_else(|| "parent".to_string()),
-            _ => part.trim_start_matches('\\').to_string(),
-        }
-    };
+    let normalize_single = |part: &str| -> String { part.trim_start_matches('\\').to_string() };
 
     if core.contains('|') {
         let mut parts: Vec<String> = core
