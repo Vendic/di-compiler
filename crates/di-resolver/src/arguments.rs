@@ -125,10 +125,7 @@ pub fn resolve_for_class(
     for param in &ctor.params {
         // Check if di.xml overrides this param
         if let Some(di_arg) = di_arg_map.get(param.name.as_str()) {
-            let type_hint = param
-                .type_hint
-                .as_deref()
-                .and_then(|hint| first_non_null_class_type_hint_arm(hint, &info.namespace));
+            let type_hint = param.type_hint.as_deref().and_then(parameter_class);
             resolved.push(ResolvedArg {
                 name: param.name.clone(),
                 resolved: if type_hint.is_some() {
@@ -153,11 +150,7 @@ pub fn resolve_for_class(
             ResolvedArgValue::Null
         } else if param.is_optional {
             resolve_non_object_default(param.default_value.as_deref(), const_map)
-        } else if let Some(type_hint) = param
-            .type_hint
-            .as_deref()
-            .and_then(|hint| first_non_null_class_type_hint_arm(hint, &info.namespace))
-        {
+        } else if let Some(type_hint) = param.type_hint.as_deref().and_then(parameter_class) {
             let concrete = di_config.get_preference(&type_hint);
             // PHP's ArgumentsResolver.getInstanceArgument() calls isShared() on the
             // TYPE HINT as-is (not the resolved concrete). So TransactionManagerInterface
@@ -437,31 +430,31 @@ fn normalize(s: &str) -> String {
     s.trim().trim_start_matches('\\').to_string()
 }
 
-fn first_non_null_class_type_hint_arm(type_hint: &str, namespace: &str) -> Option<String> {
+/// `GetParameterClassTrait::getParameterClass()`. A union has no `isBuiltin()`, so it has no
+/// class. PHP reflects `A|null` as a named type, so that one does. A builtin type has none.
+fn parameter_class(type_hint: &str) -> Option<String> {
     const NON_CLASS_TYPES: &[&str] = &[
-        "null", "false", "true", "int", "float", "string", "bool", "array", "callable", "mixed",
-        "void", "never", "self", "parent", "static",
+        "false", "true", "int", "float", "string", "bool", "array", "callable", "mixed", "void",
+        "never", "object", "iterable", "self", "parent", "static",
     ];
 
-    // Magento's GetParameterClassTrait finds no class for an intersection type.
     if type_hint.contains('&') {
         return None;
     }
 
-    type_hint
+    let mut arms = type_hint
         .split('|')
-        .map(str::trim)
-        .map(|arm| arm.trim_start_matches('?').trim_start_matches('\\'))
-        .find(|arm| !arm.is_empty() && !NON_CLASS_TYPES.contains(arm))
-        .map(|arm| {
-            // Magento's ScalarTypesProvider does not include PHP's object/iterable
-            // pseudo-types. ArgumentsReader therefore namespace-resolves them.
-            if matches!(arm, "object" | "iterable") && !namespace.is_empty() {
-                format!("{namespace}\\{arm}")
-            } else {
-                arm.to_string()
-            }
-        })
+        .map(|arm| arm.trim().trim_start_matches('?').trim_start_matches('\\'))
+        .filter(|arm| !arm.is_empty() && !arm.eq_ignore_ascii_case("null"));
+    let arm = arms.next()?;
+    if arms.next().is_some()
+        || NON_CLASS_TYPES
+            .iter()
+            .any(|builtin| arm.eq_ignore_ascii_case(builtin))
+    {
+        return None;
+    }
+    Some(arm.to_string())
 }
 
 fn resolve_di_argument(
@@ -1308,23 +1301,6 @@ mod tests {
     }
 
     #[test]
-    fn test_union_with_primitive_uses_class_arm() {
-        let mut class_map = FxHashMap::default();
-        class_map.insert(
-            "App\\Service".to_string(),
-            make_class("App\\Service", vec![("dep", Some("string|App\\Dep"))]),
-        );
-
-        let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
-        let args = &map["App\\Service"];
-        assert!(matches!(
-            &args[0].resolved,
-            ResolvedArgValue::SharedInstance(fqcn) if fqcn == "App\\Dep"
-        ));
-    }
-
-    #[test]
     fn test_union_without_class_resolves_null() {
         let mut class_map = FxHashMap::default();
         class_map.insert(
@@ -1336,40 +1312,6 @@ mod tests {
         let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\Service"];
         assert!(matches!(&args[0].resolved, ResolvedArgValue::Null));
-    }
-
-    #[test]
-    fn test_object_type_hint_matches_magento_namespace_resolution_limit() {
-        let mut class_map = FxHashMap::default();
-        class_map.insert(
-            "App\\Service".to_string(),
-            make_class("App\\Service", vec![("dep", Some("object"))]),
-        );
-
-        let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
-        let args = &map["App\\Service"];
-        assert!(matches!(
-            &args[0].resolved,
-            ResolvedArgValue::SharedInstance(fqcn) if fqcn == "App\\object"
-        ));
-    }
-
-    #[test]
-    fn test_iterable_type_hint_matches_magento_namespace_resolution_limit() {
-        let mut class_map = FxHashMap::default();
-        class_map.insert(
-            "App\\Service".to_string(),
-            make_class("App\\Service", vec![("items", Some("iterable"))]),
-        );
-
-        let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
-        let args = &map["App\\Service"];
-        assert!(matches!(
-            &args[0].resolved,
-            ResolvedArgValue::SharedInstance(fqcn) if fqcn == "App\\iterable"
-        ));
     }
 
     #[test]
@@ -1479,6 +1421,54 @@ mod tests {
             Some(ResolvedArgValue::SharedInstance(v))
             if v == "Magento\\Backend\\App\\Request\\BackendValidator"
         ));
+    }
+
+    fn resolve_one_param(hint: &str) -> ResolvedArgValue {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class("App\\Service", vec![("dep", Some(hint))]),
+        );
+        let map = resolve_all_arguments(&class_map, &DiConfig::default(), &FxHashMap::default());
+        map["App\\Service"][0].resolved.clone()
+    }
+
+    #[test]
+    fn test_builtin_object_and_iterable_are_not_classes() {
+        for hint in ["object", "?object", "object|null", "iterable", "?iterable"] {
+            assert!(
+                matches!(resolve_one_param(hint), ResolvedArgValue::Null),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_union_of_two_types_has_no_class() {
+        for hint in [
+            "App\\A|App\\B",
+            "App\\A|false",
+            "?App\\A|App\\B",
+            "App\\A|int",
+        ] {
+            assert!(
+                matches!(resolve_one_param(hint), ResolvedArgValue::Null),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_class_with_null_is_a_class() {
+        for hint in ["?App\\A", "App\\A|null", "null|App\\A", "App\\A"] {
+            assert!(
+                matches!(
+                    resolve_one_param(hint),
+                    ResolvedArgValue::SharedInstance(ref name) if name == "App\\A"
+                ),
+                "{hint}"
+            );
+        }
     }
 
     #[test]
