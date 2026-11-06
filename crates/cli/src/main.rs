@@ -1060,6 +1060,13 @@ fn main() {
         );
     }
 
+    add_virtual_type_targets_with_plugins(
+        &mut interception_class_map,
+        &interception_di_config,
+        &disabled_class_map,
+        &proxies,
+    );
+
     if let Some(class) = final_class_with_plugins(
         &class_map,
         &interception_class_map,
@@ -4852,6 +4859,105 @@ fn augment_with_composer_plugin_owner_classes(
             class_map.insert(info.fqcn.clone(), info);
         }
     }
+}
+
+/// `PluginList::_loadScopedData()` runs `_inheritPlugins()` on every virtual type, which goes on to
+/// the class of that type. `InterceptionConfigurationBuilder` gives each result with plugins an
+/// Interceptor, without the scan or `InterceptableValidator`. So this also holds for a class of a
+/// disabled module and for a generated proxy.
+fn add_virtual_type_targets_with_plugins(
+    class_map: &mut FxHashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    disabled_class_map: &FxHashMap<String, ClassInfo>,
+    proxies: &[di_resolver::ProxySpec],
+) {
+    let has_active_plugin = |class: &str| {
+        di_config
+            .plugins
+            .get(class)
+            .is_some_and(|plugins| plugins.iter().any(|plugin| plugin.is_active()))
+    };
+    for virtual_type in di_config.virtual_types.keys() {
+        let target = di_config.get_instance_type(virtual_type);
+        if class_map.contains_key(&target) {
+            continue;
+        }
+        let info = disabled_class_map.get(&target).cloned().or_else(|| {
+            proxies
+                .iter()
+                .find(|spec| spec.proxy_fqcn == target)
+                .map(synthetic_proxy_class_info)
+        });
+        let Some(info) = info else {
+            continue;
+        };
+        // `class_parents()` and `class_implements()`, through the scan and disabled modules.
+        let mut found = has_active_plugin(&target);
+        let mut pending: Vec<String> = relations_of(&info);
+        let mut add = vec![info];
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            found = found || has_active_plugin(&name);
+            if let Some(known) = class_map.get(&name) {
+                pending.extend(relations_of(known));
+            } else if let Some(disabled) = disabled_class_map.get(&name) {
+                pending.extend(relations_of(disabled));
+                add.push(disabled.clone());
+            }
+        }
+        if found {
+            class_map.extend(add.into_iter().map(|info| (info.fqcn.clone(), info)));
+        }
+    }
+}
+
+fn relations_of(info: &ClassInfo) -> Vec<String> {
+    info.extends
+        .iter()
+        .chain(&info.implements)
+        .map(|name| name.trim_start_matches('\\').to_string())
+        .collect()
+}
+
+/// The class `Code\Generator\Proxy` writes, as far as an Interceptor needs it.
+fn synthetic_proxy_class_info(spec: &di_resolver::ProxySpec) -> ClassInfo {
+    let parameter =
+        |name: &str, type_hint: Option<&str>, default_value: Option<String>| ConstructorParam {
+            name: name.to_string(),
+            type_hint: type_hint.map(str::to_string),
+            is_optional: default_value.is_some(),
+            default_value,
+            is_primitive: type_hint.is_none(),
+            is_variadic: false,
+            is_promoted: false,
+        };
+    let mut info = synthetic_reflected_class_info(
+        &spec.proxy_fqcn,
+        vec![
+            parameter(
+                "objectManager",
+                Some("Magento\\Framework\\ObjectManagerInterface"),
+                None,
+            ),
+            parameter(
+                "instanceName",
+                None,
+                Some(format!(
+                    "'\\\\{}'",
+                    spec.target_fqcn
+                        .trim_start_matches('\\')
+                        .replace('\\', "\\\\")
+                )),
+            ),
+            parameter("shared", None, Some("true".to_string())),
+        ],
+    );
+    info.path = PathBuf::from("__generated__/proxy.php");
+    info.extends = Some(spec.target_fqcn.clone());
+    info
 }
 
 /// `PluginListGenerator` reaches classes through the autoloader. Add what the scan left out:
