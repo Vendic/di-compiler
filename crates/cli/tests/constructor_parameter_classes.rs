@@ -148,12 +148,10 @@ fn missing_class_in_a_plain_method_compiles() {
 }
 
 #[test]
-fn class_the_file_does_not_declare_stops_the_compile() {
+fn class_inside_if_compiles_because_magento_does_not_scan_it() {
     let source = thing("if (class_exists(\\Acme\\Gone::class)) {\n    class Thing {}\n}");
     let Some(output) = compile_with(&[(THING, &source)]) else {
         return;
     };
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("Acme\\On\\Model\\Thing"), "{stderr}");
+    assert_compiles(&output);
 }

@@ -638,6 +638,7 @@ fn main() {
     let _cache_ref = &cache;
 
     let file_level_checks = Mutex::new(Vec::new());
+    let classes_inside_a_block = Mutex::new(Vec::new());
     let scanned_files = Mutex::new(Vec::with_capacity(php_files.len()));
     let scanned = |class: &str, path: &Path| {
         scanned_files.lock().unwrap().push(ScannedFile {
@@ -648,12 +649,21 @@ fn main() {
     let mut class_map: FxHashMap<String, ClassInfo> = php_files
         .par_iter()
         .filter_map(|path| {
-            let (result, has_class_check) = extract_file_with_class_check(path);
+            let (result, facts) = extract_file_with_class_check(path);
             pb.inc(1);
             match result {
                 ExtractResult::Ok(info) => {
-                    scanned(&info.fqcn, path);
-                    if has_class_check {
+                    // `FileClassScanner` does not see this class, so Magento does not load the
+                    // file during compile. Enabled code can still name the class.
+                    if facts.inside_block {
+                        classes_inside_a_block
+                            .lock()
+                            .unwrap()
+                            .push(info.fqcn.clone());
+                    } else {
+                        scanned(&info.fqcn, path);
+                    }
+                    if facts.class_check {
                         file_level_checks
                             .lock()
                             .unwrap()
@@ -709,6 +719,11 @@ fn main() {
         &magento_root,
         &args.fallback_php,
     );
+    for class in classes_inside_a_block.into_inner().unwrap() {
+        if let Some(info) = class_map.remove(&class) {
+            disabled_class_map.insert(class, info);
+        }
+    }
 
     let composer_autoload = ComposerAutoloadIndex::from_magento_root(&magento_root);
     apply_traits(&mut class_map, &|name| {

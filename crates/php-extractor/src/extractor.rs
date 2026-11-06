@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::lexer::Lexer;
+use crate::lexer::{Lexer, ScanFacts};
 use crate::tier2::extract_tier2;
 use crate::tier3::extract_tier3;
 use crate::types::{ExtractResult, LexError};
@@ -10,11 +10,10 @@ pub fn extract_file(path: &Path) -> ExtractResult {
     extract_file_with_class_check(path).0
 }
 
-/// Like [`extract_file`], and also says whether Tier 1 saw a `class_exists()` or
-/// sibling before the class declaration.
-pub fn extract_file_with_class_check(path: &Path) -> (ExtractResult, bool) {
-    let result = match Lexer::extract_with_class_check(path) {
-        Ok((info, class_check)) => return (ExtractResult::Ok(info), class_check),
+/// Like [`extract_file`], and also says what Tier 1 saw around the class declaration.
+pub fn extract_file_with_class_check(path: &Path) -> (ExtractResult, ScanFacts) {
+    let result = match Lexer::extract_with_facts(path) {
+        Ok((info, facts)) => return (ExtractResult::Ok(info), facts),
         Err(LexError::Io(e)) => ExtractResult::PhpFallbackFailed(format!("IO: {e}")),
         Err(LexError::Unsupported(ref reason)) if reason == "no_class" => ExtractResult::NoClass,
         Err(LexError::Unsupported(ref reason)) if reason == "enum" => ExtractResult::NoClass,
@@ -39,5 +38,5 @@ pub fn extract_file_with_class_check(path: &Path) -> (ExtractResult, bool) {
             }
         }
     };
-    (result, false)
+    (result, ScanFacts::default())
 }
