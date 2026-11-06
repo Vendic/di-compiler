@@ -43,8 +43,8 @@ use di_resolver::{
 };
 use di_xml_reader::{
     apply_module_config_on_primary, find_all_di_xml_files, find_di_xml_files,
-    find_di_xml_files_for_area, merge_configs, merge_into, parse_di_xml, Argument, DiConfig,
-    Plugin,
+    find_di_xml_files_for_area, merge_configs, merge_into, parse_di_xml_unfolded, Argument,
+    DiConfig, Plugin,
 };
 use php_extractor::{
     extract_file, extract_file_with_class_check, extract_string_constants,
@@ -568,7 +568,7 @@ fn main() {
     let global_di_path_configs: Vec<_> = di_xml_files
         .par_iter()
         .filter_map(|path| {
-            let r = parse_di_xml(path);
+            let r = parse_di_xml_unfolded(path);
             pb.inc(1);
             match r {
                 Ok(cfg) => Some((path.clone(), cfg)),
@@ -588,8 +588,10 @@ fn main() {
     let di_config = merge_global_di_configs(&global_di_path_configs, &magento_root);
 
     // Flat Vec<DiConfig> (without path) for detection purposes (plugins/types, not arg values).
-    let global_di_configs: Vec<DiConfig> =
-        global_di_path_configs.into_iter().map(|(_, c)| c).collect();
+    let global_di_configs: Vec<DiConfig> = global_di_path_configs
+        .into_iter()
+        .map(|(_, c)| folded(c))
+        .collect();
     // HashSet for O(1) membership tests — used in Phase 3b and Phase 7 filters.
     let di_xml_files_set: FxHashSet<&PathBuf> = di_xml_files.iter().collect();
     log_phase_elapsed("Phase 3a", phase_3a_started);
@@ -618,7 +620,11 @@ fn main() {
     // area loop can look up already-parsed configs instead of re-parsing.
     let area_di_xml_cache: FxHashMap<std::path::PathBuf, DiConfig> = extra_di_files
         .par_iter()
-        .filter_map(|path| parse_di_xml(path).ok().map(|cfg| ((*path).clone(), cfg)))
+        .filter_map(|path| {
+            parse_di_xml_unfolded(path)
+                .ok()
+                .map(|cfg| ((*path).clone(), cfg))
+        })
         .collect();
     // Preserve original file order for deterministic scanner_di_configs merge.
     let extra_configs: Vec<DiConfig> = extra_di_files
@@ -627,7 +633,7 @@ fn main() {
         .collect();
 
     let mut scanner_di_configs = global_di_configs.clone();
-    scanner_di_configs.extend(extra_configs.clone());
+    scanner_di_configs.extend(extra_configs.iter().cloned().map(folded));
 
     let full_di_config = if extra_configs.is_empty() {
         di_config.clone()
@@ -1428,7 +1434,7 @@ fn main() {
                                     area_di_xml_cache
                                         .get(*p)
                                         .cloned()
-                                        .or_else(|| parse_di_xml(p).ok())
+                                        .or_else(|| parse_di_xml_unfolded(p).ok())
                                 })
                                 .collect();
                             // Area-specific module configs applied via the same two-phase merge as
@@ -5505,6 +5511,12 @@ fn module_root_from_di_xml(di_xml: &Path) -> Option<&Path> {
     }
 }
 
+/// One parsed file on its own, for code that does not merge it.
+fn folded(mut config: DiConfig) -> DiConfig {
+    config.fold_spellings();
+    config
+}
+
 /// Merge the primary files and the module files in two phases, see Phase 3a.
 fn merge_global_di_configs(configs: &[(PathBuf, DiConfig)], magento_root: &Path) -> DiConfig {
     let app_etc = magento_root.join("app/etc");
@@ -6264,7 +6276,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let config = super::parse_di_xml(&path).unwrap();
+            let config = super::parse_di_xml_unfolded(&path).unwrap();
             (path, config)
         };
         let configs = vec![

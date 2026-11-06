@@ -1,3 +1,4 @@
+use indexmap::IndexSet;
 use rustc_hash::FxHashMap;
 
 /// Merged DI configuration from all di.xml files.
@@ -15,6 +16,9 @@ pub struct DiConfig {
     pub preference_keys_lc: FxHashMap<String, String>,
     /// Lowercased type config key -> canonical key (for fast case-insensitive lookup)
     pub type_config_keys_lc: FxHashMap<String, String>,
+    /// `<type>` and `<virtualType>` names in first-seen order. Until `fold_spellings` runs
+    /// they hold the spelling from the file, because `\\X` and `X` are separate nodes.
+    pub type_nodes: IndexSet<String>,
 }
 
 impl DiConfig {

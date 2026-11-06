@@ -264,6 +264,7 @@ dependencies = [
 name = "di-xml-reader"
 version = "1.0.2"
 dependencies = [
+ "indexmap",
  "insta",
  "log",
  "quick-xml",

@@ -97,16 +97,16 @@ impl DiConfig {
 
     /// Walk all di.xml files for a Magento install in correct merge order.
     ///
-    /// Order: app/etc (primary) → vendor/magento → vendor/* (non-magento) → app/code
+    /// Order: app/etc (primary), then modules in `app/etc/config.php` order.
     pub fn load_from_magento_root(
         magento_root: &std::path::Path,
     ) -> Result<DiConfig, crate::Error> {
-        use crate::parser::parse_di_xml_impl;
+        use crate::parser::parse_di_xml_unfolded;
 
         let mut configs = Vec::new();
         let di_xml_paths = find_di_xml_files(magento_root, &FxHashMap::default());
         for path in di_xml_paths {
-            match parse_di_xml_impl(&path) {
+            match parse_di_xml_unfolded(&path) {
                 Ok(c) => configs.push(c),
                 Err(e) => {
                     log::warn!("Failed to parse {}: {e}", path.display());
@@ -143,9 +143,9 @@ fn type_config_case_insensitive<'a>(
 /// Collect **global-only** di.xml files in Magento merge order.
 ///
 /// Only includes `etc/di.xml` files (not area-specific `etc/{area}/di.xml`).
-/// Merge order: app/etc (primary) → vendor/magento/* → vendor/*/* → app/code/*/*
-/// Within each priority tier, files are ordered by Magento module load order
-/// from `app/etc/config.php` (the `module_order` map), then by path.
+/// Merge order: app/etc (primary), then modules by load order from `app/etc/config.php`
+/// (the `module_order` map), wherever the module lives, then by path. This is
+/// `Module\Dir\Reader::getFiles()` walking `ModuleList::getNames()`.
 pub fn find_di_xml_files(
     magento_root: &std::path::Path,
     module_order: &FxHashMap<String, usize>,
@@ -205,9 +205,8 @@ pub fn find_all_di_xml_files(
 
 /// Internal: collect di.xml files with optional area overlay.
 ///
-/// Each entry is `(priority, module_idx, path)` where priority controls the
-/// broad merge tier and module_idx is the Magento module load order index from
-/// `app/etc/config.php`, providing deterministic tie-breaking within each tier.
+/// Each entry is `(priority, module_idx, path)` where priority puts the primary files
+/// first and module_idx is the Magento module load order index from `app/etc/config.php`.
 fn collect_di_xml_files(
     magento_root: &std::path::Path,
     area: Option<&str>,
@@ -362,7 +361,7 @@ fn collect_di_xml_files(
         }
     }
 
-    // Priority 1: vendor/magento/*
+    // Priority 1, all modules. vendor/magento/*
     collect_vendor(
         &magento_root.join("vendor/magento"),
         1,
@@ -372,7 +371,7 @@ fn collect_di_xml_files(
         false,
     );
 
-    // Priority 2: other vendor/vendor/* (non-magento)
+    // Other vendor/vendor/* (non-magento)
     if let Ok(vendors) = std::fs::read_dir(magento_root.join("vendor")) {
         for vendor in vendors.flatten() {
             if vendor
@@ -383,11 +382,11 @@ fn collect_di_xml_files(
             {
                 continue;
             }
-            collect_vendor(&vendor.path(), 2, area, module_order, &mut paths, true);
+            collect_vendor(&vendor.path(), 1, area, module_order, &mut paths, true);
         }
     }
 
-    // Priority 3: app/code/*/*/etc/di.xml
+    // app/code/*/*/etc/di.xml
     if let Ok(vendors) = std::fs::read_dir(magento_root.join("app/code")) {
         for vendor in vendors.flatten() {
             if let Ok(modules) = std::fs::read_dir(vendor.path()) {
@@ -397,12 +396,12 @@ fn collect_di_xml_files(
                         .unwrap_or(usize::MAX);
                     let global = module.path().join("etc/di.xml");
                     if global.exists() {
-                        paths.push((3, module_idx, global));
+                        paths.push((1, module_idx, global));
                     }
                     if let Some(a) = area {
                         let area_di = module.path().join(format!("etc/{}/di.xml", a));
                         if area_di.exists() {
-                            paths.push((3, module_idx, area_di));
+                            paths.push((1, module_idx, area_di));
                         }
                     }
                 }
@@ -621,6 +620,42 @@ mod tests {
         assert_eq!(vendor_paths.len(), 2);
         assert_eq!(vendor_paths[0], &module_b.join("etc/di.xml"));
         assert_eq!(vendor_paths[1], &module_a.join("etc/di.xml"));
+    }
+
+    #[test]
+    fn test_find_di_xml_files_uses_config_php_order_wherever_the_module_lives() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let modules = [
+            ("app/code/Acme/Local", "Acme_Local"),
+            ("vendor/acme/module-other", "Acme_Other"),
+            ("vendor/magento/module-core", "Magento_Core"),
+        ];
+        let mut module_order = FxHashMap::default();
+        for (idx, (dir, name)) in modules.iter().enumerate() {
+            fs::create_dir_all(root.join(dir).join("etc")).unwrap();
+            fs::write(root.join(dir).join("etc/di.xml"), "<config/>").unwrap();
+            fs::write(
+                root.join(dir).join("etc/module.xml"),
+                format!(r#"<config><module name="{name}"/></config>"#),
+            )
+            .unwrap();
+            module_order.insert(name.to_string(), idx);
+        }
+        fs::create_dir_all(root.join("app/etc")).unwrap();
+        fs::write(root.join("app/etc/di.xml"), "<config/>").unwrap();
+
+        let paths = super::find_di_xml_files(root, &module_order);
+
+        assert_eq!(
+            paths,
+            vec![
+                root.join("app/etc/di.xml"),
+                root.join("app/code/Acme/Local/etc/di.xml"),
+                root.join("vendor/acme/module-other/etc/di.xml"),
+                root.join("vendor/magento/module-core/etc/di.xml"),
+            ]
+        );
     }
 
     #[test]

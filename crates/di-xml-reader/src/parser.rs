@@ -19,6 +19,18 @@ pub fn parse_di_xml_impl(path: &Path) -> Result<DiConfig, Error> {
 }
 
 pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
+    let mut config = parse_di_xml_bytes_unfolded(content)?;
+    config.fold_spellings();
+    Ok(config)
+}
+
+/// Parse one file for a later merge. Types stay under the spelling from the file, because
+/// Magento merges `\\X` and `X` as separate DOM nodes. `merge_configs` folds them.
+pub fn parse_di_xml_unfolded(path: &Path) -> Result<DiConfig, Error> {
+    parse_di_xml_bytes_unfolded(&std::fs::read(path)?)
+}
+
+pub fn parse_di_xml_bytes_unfolded(content: &[u8]) -> Result<DiConfig, Error> {
     let mut reader = Reader::from_reader(content);
     reader.config_mut().trim_text(true);
     reader.config_mut().check_end_names = false;
@@ -47,9 +59,10 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         }
                     }
                     "type" if !in_arguments => {
-                        let name = normalize(&attrs.get("name").cloned().unwrap_or_default());
-                        if !name.is_empty() {
+                        let name = spelled_name(&attrs);
+                        if !normalize(&name).is_empty() {
                             current_virtual = None;
+                            config.type_nodes.insert(name.clone());
                             let entry = config.type_configs.entry(name).or_default();
                             if let Some(shared_str) = attrs.get("shared") {
                                 entry.shared = Some(shared_str != "false");
@@ -59,7 +72,8 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         }
                     }
                     "virtualType" => {
-                        let name = normalize(&attrs.get("name").cloned().unwrap_or_default());
+                        let spelled = spelled_name(&attrs);
+                        let name = normalize(&spelled);
                         let type_name = normalize(&attrs.get("type").cloned().unwrap_or_default());
                         if !name.is_empty() {
                             // Magento's Mapper\Dom sets `type` only when the attribute exists.
@@ -73,7 +87,8 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                                     },
                                 );
                             }
-                            let entry = config.type_configs.entry(name).or_default();
+                            config.type_nodes.insert(spelled.clone());
+                            let entry = config.type_configs.entry(spelled).or_default();
                             if let Some(shared_str) = attrs.get("shared") {
                                 entry.shared = Some(shared_str != "false");
                             }
@@ -173,10 +188,11 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         }
                     }
                     "type" if !in_arguments => {
-                        let name = normalize(&attrs.get("name").cloned().unwrap_or_default());
-                        if !name.is_empty() {
+                        let name = spelled_name(&attrs);
+                        if !normalize(&name).is_empty() {
                             current_type = Some(name.clone());
                             current_virtual = None;
+                            config.type_nodes.insert(name.clone());
                             let entry = config.type_configs.entry(name).or_default();
                             if let Some(shared_str) = attrs.get("shared") {
                                 entry.shared = Some(shared_str != "false");
@@ -184,10 +200,11 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         }
                     }
                     "virtualType" => {
-                        let name = normalize(&attrs.get("name").cloned().unwrap_or_default());
+                        let spelled = spelled_name(&attrs);
+                        let name = normalize(&spelled);
                         let type_name = normalize(&attrs.get("type").cloned().unwrap_or_default());
                         if !name.is_empty() {
-                            current_virtual = Some(name.clone());
+                            current_virtual = Some(spelled.clone());
                             current_type = None;
                             // Magento's Mapper\Dom sets `type` only when the attribute exists.
                             // Without it the entry only holds settings for the named class.
@@ -200,7 +217,8 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                                     },
                                 );
                             }
-                            let entry = config.type_configs.entry(name).or_default();
+                            config.type_nodes.insert(spelled.clone());
+                            let entry = config.type_configs.entry(spelled).or_default();
                             if let Some(shared_str) = attrs.get("shared") {
                                 entry.shared = Some(shared_str != "false");
                             }
@@ -347,6 +365,14 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The `name` attribute as the file spells it, so with any leading backslash.
+fn spelled_name(attrs: &FxHashMap<String, String>) -> String {
+    attrs
+        .get("name")
+        .map(|name| name.trim().to_string())
+        .unwrap_or_default()
+}
 
 struct ArgContext {
     name: String,
