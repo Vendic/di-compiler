@@ -219,7 +219,13 @@ fn merge_type_config(dst: &mut TypeConfig, src: TypeConfig) {
 /// Merge `src_arg` into `dst_arg`.
 /// For Array arguments both sides are merged recursively by item name.
 /// All other types: last-wins (src replaces dst).
-fn merge_argument(dst: &mut Argument, src: Argument) {
+fn merge_argument(dst: &mut Argument, mut src: Argument) {
+    // `Config\Dom` merges node by node, so an attribute of an earlier file stays.
+    if *sort_order_of(&mut src) == 0 {
+        *sort_order_of(&mut src) = *sort_order_of(dst);
+    }
+    let sort_order = *sort_order_of(&mut src);
+    *sort_order_of(dst) = sort_order;
     match (dst, src) {
         (
             Argument::Array {
@@ -252,6 +258,19 @@ fn merge_argument(dst: &mut Argument, src: Argument) {
             }
             *dst = src;
         }
+    }
+}
+
+fn sort_order_of(arg: &mut Argument) -> &mut i32 {
+    match arg {
+        Argument::Object { sort_order, .. }
+        | Argument::String { sort_order, .. }
+        | Argument::Boolean { sort_order, .. }
+        | Argument::Number { sort_order, .. }
+        | Argument::Null { sort_order, .. }
+        | Argument::Array { sort_order, .. }
+        | Argument::Init { sort_order, .. }
+        | Argument::Const { sort_order, .. } => sort_order,
     }
 }
 
