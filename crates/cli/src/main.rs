@@ -3651,9 +3651,6 @@ fn build_interception_preference_overrides(
     let mut resolved_preferences: FxHashMap<String, String> = FxHashMap::default();
     for (from, to) in &di_config.preferences {
         let from_norm = normalize_fqcn(from);
-        if di_config.virtual_types.contains_key(&from_norm) {
-            continue;
-        }
         let resolved = resolve_preference_recursive(to, &di_config.preferences);
         let substituted = direct_interceptors
             .get(resolved.as_str())
