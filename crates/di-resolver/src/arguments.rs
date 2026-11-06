@@ -360,30 +360,41 @@ fn merged_di_arguments_for_type_name(
     //    semantics) rather than replacing — this is critical for arguments like `commands`
     //    that are contributed by many di.xml files across many modules.
     let mut merged: Vec<Argument> = Vec::new();
-    let mut by_name: FxHashMap<String, usize> = FxHashMap::default();
 
     for ancestor in &class_hierarchy {
         let chain = virtual_type_chain(ancestor, di_config);
         for current in chain.iter().rev() {
-            for arg in di_config.get_arguments(current) {
+            // What a type inherits has been through `sortItems()` once before its own arguments.
+            sort_items_after_merge(&mut merged);
+            let own = di_config.get_arguments(current);
+            if own.is_empty() {
+                continue;
+            }
+            let inherits = !merged.is_empty();
+            for arg in own {
                 let arg = with_items_sorted_as_read(arg);
-                let name = argument_name(&arg).to_string();
-                if let Some(idx) = by_name.get(&name).copied() {
-                    merge_argument_into(&mut merged[idx], &arg);
+                let name = argument_name(&arg);
+                if let Some(existing) = merged.iter_mut().find(|a| argument_name(a) == name) {
+                    merge_argument_into(existing, &arg);
                 } else {
-                    by_name.insert(name, merged.len());
                     merged.push(arg);
                 }
+            }
+            if inherits {
+                sort_items_after_merge(&mut merged);
             }
         }
     }
 
+    for arg in &mut merged {
+        clear_sort_orders(arg);
+    }
     merged
 }
 
-/// `ArrayType::evaluate()` sorts array items when it reads the merged di.xml of one scope, and
-/// leaves no `sortOrder` behind. So what a type inherits later keeps this order, and the new items
-/// of a child go last. Items with equal `sortOrder` keep their order.
+/// `ArrayType::evaluate()` sorts array items when it reads the merged di.xml of one scope, with
+/// equal values in their own order. After that only an object item still has its `sortOrder`,
+/// because `Interpreter\\DataObject` copies it.
 fn with_items_sorted_as_read(arg: &Argument) -> Argument {
     let mut arg = arg.clone();
     sort_items_as_read(&mut arg);
@@ -395,7 +406,53 @@ fn sort_items_as_read(arg: &mut Argument) {
         items.sort_by_key(argument_sort_order);
         for item in items.iter_mut() {
             sort_items_as_read(item);
-            clear_sort_order(item);
+            if !matches!(item, Argument::Object { .. }) {
+                clear_sort_order(item);
+            }
+        }
+    }
+}
+
+/// `SortItems::sortItems()` as `Config::_collectConfiguration()` calls it, on all arguments of a
+/// type. `isMultiSortOrder()` keeps overwriting one flag, so the last entry of the last argument
+/// that is an array decides whether anything happens: an object item with a `sortOrder`. If so, it
+/// sorts the entries of all arguments as one list and rebuilds the arguments in the order of that
+/// list, so the next merge can have another last argument.
+fn sort_items_after_merge(args: &mut [Argument]) {
+    let last_entry_has_sort_order = args
+        .iter()
+        .rev()
+        .find_map(|arg| match arg {
+            Argument::Array { items, .. } if items.is_empty() => None,
+            Argument::Array { items, .. } => items.last().map(|item| {
+                matches!(item, Argument::Object { .. }) && argument_sort_order(item) != 0
+            }),
+            Argument::Object { .. } | Argument::Init { .. } => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false);
+    if !last_entry_has_sort_order {
+        return;
+    }
+    for arg in args.iter_mut() {
+        if let Argument::Array { items, .. } = arg {
+            items.sort_by_key(argument_sort_order);
+        }
+    }
+    // The argument with the entry that sorts first goes first. A scalar has no entries to sort.
+    let first_entry = |arg: &Argument| match arg {
+        Argument::Array { items, .. } => items.first().map(argument_sort_order),
+        Argument::Object { .. } | Argument::Init { .. } => Some(0),
+        _ => None,
+    };
+    args.sort_by_key(|arg| first_entry(arg).unwrap_or(i32::MAX));
+}
+
+fn clear_sort_orders(arg: &mut Argument) {
+    clear_sort_order(arg);
+    if let Argument::Array { items, .. } = arg {
+        for item in items {
+            clear_sort_orders(item);
         }
     }
 }
@@ -435,7 +492,16 @@ fn merge_argument_into(dst: &mut Argument, src: &Argument) {
                 }
             }
         }
-        (dst, src) => *dst = src.clone(),
+        (dst, src) => {
+            // `array_replace_recursive` keeps a `sortOrder` that the later value does not set.
+            let earlier = argument_sort_order(dst);
+            *dst = src.clone();
+            if let (Argument::Object { sort_order, .. }, true) = (dst, earlier != 0) {
+                if *sort_order == 0 {
+                    *sort_order = earlier;
+                }
+            }
+        }
     }
 }
 
