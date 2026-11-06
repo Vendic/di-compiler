@@ -304,7 +304,14 @@ function is_readonly_class(string $class): bool {
 }
 function reflect_const(string $expr) {
     $expr = ltrim($expr, '\\');
-    if ($expr === '' || !defined($expr)) return null;
+    if ($expr === '') return null;
+    // `bin/magento` has loaded `app/bootstrap.php` by then, and that defines constants too.
+    if (!defined($expr) && is_file($GLOBALS['root'] . '/app/bootstrap.php')) {
+        ob_start();
+        require_once $GLOBALS['root'] . '/app/bootstrap.php';
+        ob_end_clean();
+    }
+    if (!defined($expr)) return ['__fast_di_undefined_constant__' => true];
     return constant($expr);
 }
 function reflect_ctor(string $class): ?array {
@@ -2762,6 +2769,13 @@ fn reflect_constant_value(
         return Some(ResolvedConstValue::Null);
     }
     let value: serde_json::Value = serde_json::from_str(json_trimmed).ok()?;
+    // `Interpreter\Constant::evaluate()` throws here, and that stops the compile.
+    if value.get("__fast_di_undefined_constant__").is_some() {
+        stop_compile(&format!(
+            "Constant \"{}\" is not defined.",
+            expr.trim().trim_start_matches('\\')
+        ));
+    }
     match value {
         serde_json::Value::String(s) => Some(ResolvedConstValue::String(s)),
         serde_json::Value::Number(n) => Some(ResolvedConstValue::Number(n.to_string())),
