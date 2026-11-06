@@ -2662,6 +2662,7 @@ fn compute_phase7_fp(
                 ResolvedConstValue::Bool(true) => (2u8, "true"),
                 ResolvedConstValue::Bool(false) => (3u8, "false"),
                 ResolvedConstValue::Null => (4u8, ""),
+                ResolvedConstValue::Array(json, _) => (5u8, json.as_str()),
             };
             (k.as_str(), tag, s)
         })
@@ -2704,6 +2705,8 @@ enum ResolvedConstValue {
     Number(String),
     Bool(bool),
     Null,
+    /// The JSON text, for the fingerprint, and the items.
+    Array(String, Vec<Argument>),
 }
 
 fn resolve_php_constants_in_config(
@@ -2762,7 +2765,52 @@ fn reflect_constant_value(
         serde_json::Value::Number(n) => Some(ResolvedConstValue::Number(n.to_string())),
         serde_json::Value::Bool(b) => Some(ResolvedConstValue::Bool(b)),
         serde_json::Value::Null => Some(ResolvedConstValue::Null),
-        _ => None,
+        array => Some(ResolvedConstValue::Array(
+            json_trimmed.to_string(),
+            constant_array_items(&array),
+        )),
+    }
+}
+
+/// `Interpreter\Constant::evaluate()` returns the constant as it is, so also an array.
+fn constant_array_items(array: &serde_json::Value) -> Vec<Argument> {
+    let item = |name: String, value: &serde_json::Value| match value {
+        serde_json::Value::String(value) => Argument::String {
+            name,
+            value: value.clone(),
+            sort_order: 0,
+        },
+        serde_json::Value::Number(value) => Argument::Number {
+            name,
+            value: value.to_string(),
+            sort_order: 0,
+        },
+        serde_json::Value::Bool(value) => Argument::Boolean {
+            name,
+            value: *value,
+            sort_order: 0,
+        },
+        serde_json::Value::Null => Argument::Null {
+            name,
+            sort_order: 0,
+        },
+        nested => Argument::Array {
+            name,
+            items: constant_array_items(nested),
+            sort_order: 0,
+        },
+    };
+    match array {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| item(index.to_string(), value))
+            .collect(),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| item(key.clone(), value))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -2810,6 +2858,11 @@ fn apply_resolved_constants_to_arguments(
                         },
                         ResolvedConstValue::Null => Argument::Null {
                             name: name.clone(),
+                            sort_order: so,
+                        },
+                        ResolvedConstValue::Array(_, items) => Argument::Array {
+                            name: name.clone(),
+                            items: items.clone(),
                             sort_order: so,
                         },
                     };
