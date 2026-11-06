@@ -38,11 +38,11 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
     let lib_internal = magento_root.join("lib/internal");
     for vendor in subfolders(&lib_internal) {
         for package in subfolders(&vendor) {
-            if package.join("registration.php").exists() {
+            if registers_component(&package) {
                 paths.push(package.clone());
             }
             for nested in subfolders(&package) {
-                if nested.join("registration.php").exists() {
+                if registers_component(&nested) {
                     paths.push(nested);
                 }
             }
@@ -98,6 +98,13 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+/// `DiCompileCommand` scans the paths in `ComponentRegistrar`. A `registration.php` is only a plain
+/// PHP file that Magento loads, so a folder is a component only when that file registers one.
+fn registers_component(folder: &Path) -> bool {
+    std::fs::read_to_string(folder.join("registration.php"))
+        .is_ok_and(|registration| registration.contains("::register("))
 }
 
 fn subfolders(folder: &Path) -> Vec<PathBuf> {
@@ -314,8 +321,15 @@ mod tests {
     fn libraries_in_lib_internal_are_found_at_both_depths() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        touch(root, "lib/internal/Acme/Lib/registration.php");
-        touch(root, "lib/internal/Acme/Deep/Lib/registration.php");
+        let registers =
+            "<?php\nComponentRegistrar::register(ComponentRegistrar::LIBRARY, 'a/b', __DIR__);\n";
+        for file in [
+            "lib/internal/Acme/Lib/registration.php",
+            "lib/internal/Acme/Deep/Lib/registration.php",
+        ] {
+            touch(root, file);
+            fs::write(root.join(file), registers).unwrap();
+        }
         touch(root, "lib/internal/Acme/Plain/Thing.php");
 
         let paths = read_module_paths(root);
@@ -323,6 +337,28 @@ mod tests {
         assert!(paths.contains(&root.join("lib/internal/Acme/Lib")));
         assert!(paths.contains(&root.join("lib/internal/Acme/Deep/Lib")));
         assert!(!paths.contains(&root.join("lib/internal/Acme/Plain")));
+    }
+
+    #[test]
+    fn folder_in_lib_internal_whose_registration_registers_nothing_is_no_library() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for file in [
+            "lib/internal/Acme/Loader/registration.php",
+            "lib/internal/Acme/Loader/Part/registration.php",
+        ] {
+            touch(root, file);
+            fs::write(
+                root.join(file),
+                "<?php\n$loader = new AcmeLoader('Part', __DIR__);\n$loader->register();\n",
+            )
+            .unwrap();
+        }
+
+        let paths = read_module_paths(root);
+
+        assert!(!paths.contains(&root.join("lib/internal/Acme/Loader")));
+        assert!(!paths.contains(&root.join("lib/internal/Acme/Loader/Part")));
     }
 
     #[test]
