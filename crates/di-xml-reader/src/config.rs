@@ -73,7 +73,8 @@ impl DiConfig {
             .unwrap_or(true)
     }
 
-    /// Get active (non-disabled) plugins for a type, sorted by sort_order then name.
+    /// Get active (non-disabled) plugins for a type, sorted by sort_order. Plugins with
+    /// equal sort_order keep merge order, as PHP's stable uasort does.
     pub fn get_active_plugins(&self, fqcn: &str) -> Vec<&Plugin> {
         let name = normalize(fqcn);
         let mut plugins: Vec<&Plugin> = self
@@ -81,11 +82,7 @@ impl DiConfig {
             .get(&name)
             .map(|ps| ps.iter().filter(|p| p.is_active()).collect())
             .unwrap_or_default();
-        plugins.sort_by(|a, b| {
-            a.effective_sort_order()
-                .cmp(&b.effective_sort_order())
-                .then(a.name.cmp(&b.name))
-        });
+        plugins.sort_by_key(|plugin| plugin.effective_sort_order());
         plugins
     }
 
@@ -546,6 +543,24 @@ mod tests {
         assert_eq!(active.len(), 2); // 'a' is disabled
         assert_eq!(active[0].name, "b"); // lower sort_order first
         assert_eq!(active[1].name, "c");
+    }
+
+    #[test]
+    fn test_get_active_plugins_equal_sort_order_keeps_merge_order() {
+        let plugin = |name: &str| Plugin {
+            name: name.into(),
+            type_name: "T".into(),
+            sort_order: Some(10),
+            disabled: None,
+            disabled_after_type: false,
+        };
+        let mut config = DiConfig::default();
+        config
+            .plugins
+            .insert("Foo".into(), vec![plugin("z"), plugin("a")]);
+        let active = config.get_active_plugins("Foo");
+        assert_eq!(active[0].name, "z");
+        assert_eq!(active[1].name, "a");
     }
 
     #[test]

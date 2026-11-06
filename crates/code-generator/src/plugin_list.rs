@@ -357,12 +357,8 @@ fn inherit_plugins(
             .into_iter()
             .filter(|plugin| !plugin.instance.is_empty())
             .collect();
-        // TKT-050: secondary sort by name for deterministic tiebreak (matches PHP behaviour)
-        sorted_plugins.sort_by(|a, b| {
-            a.sort_order
-                .cmp(&b.sort_order)
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        // PHP's uasort is stable, so plugins with equal sortOrder keep merge order.
+        sorted_plugins.sort_by_key(|plugin| plugin.sort_order);
         for plugin in &mut sorted_plugins {
             plugin.instance = normalize(&plugin.instance);
         }
@@ -821,6 +817,40 @@ mod tests {
         assert!(!compiled.processed.contains_key("Foo\\Child_run___self"));
         let plugin = inherited_plugin(&compiled, "Foo\\Child", "x").unwrap();
         assert_eq!(plugin.instance, "Foo\\Plugin");
+    }
+
+    #[test]
+    fn plugins_with_equal_sort_order_keep_merge_order() {
+        let mut di_config = DiConfig::default();
+        di_config.plugins.insert(
+            "Foo".to_string(),
+            vec![
+                plugin("z", "Plugin\\Z", 10, false),
+                plugin("a", "Plugin\\A", 10, false),
+                plugin("first", "Plugin\\First", 5, false),
+            ],
+        );
+        let mut class_map = FxHashMap::default();
+        for fqcn in ["Plugin\\Z", "Plugin\\A", "Plugin\\First"] {
+            class_map.insert(
+                fqcn.to_string(),
+                class_info(fqcn, None, &[], &["beforeRun"]),
+            );
+        }
+
+        let metadata = compile_plugin_list(&di_config, &class_map, &[], false);
+
+        let names: Vec<&str> = metadata.inherited["Foo"]
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["first", "z", "a"]);
+        assert_eq!(
+            metadata.processed["Foo_run___self"].before,
+            ["first", "z", "a"]
+        );
     }
 
     #[test]
