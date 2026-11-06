@@ -941,6 +941,16 @@ fn main() {
         );
     }
 
+    if let Some(class) = final_class_with_plugins(
+        &class_map,
+        &interception_class_map,
+        &interception_di_config,
+        &magento_root.join("setup"),
+    ) {
+        eprintln!("error: Class {class}\\Interceptor cannot extend final class {class}");
+        std::process::exit(1);
+    }
+
     let mut interceptors = detect_interceptors(&interception_class_map, &interception_di_config);
     // PHP registers setup/src as type SETUP (not MODULE). It does not generate
     // interceptors for Magento\Setup\* classes that only inherit plugins (Phase 2
@@ -1869,6 +1879,52 @@ fn main() {
 
     // Clean up the temp PHP worker script.
     let _ = std::fs::remove_file(&worker_script_path);
+}
+
+/// `InterceptionConfigurationBuilder::getInterceptedClasses()` picks every scanned concrete class
+/// with `Config::hasPlugins()` true, and the generated interceptor is loaded. For a final class
+/// that is a fatal error. `hasPlugins()` also counts a disabled plugin, and plugins of parents and
+/// interfaces. `setup/` is not part of `intercepted_paths`.
+fn final_class_with_plugins(
+    class_map: &FxHashMap<String, ClassInfo>,
+    lookup: &FxHashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    setup_root: &Path,
+) -> Option<String> {
+    let has_plugins = |name: &str| di_config.plugins.get(name).is_some_and(|p| !p.is_empty());
+    let mut found: Vec<&String> = class_map
+        .iter()
+        .filter(|(fqcn, info)| {
+            if !info.is_final
+                || info.path.starts_with(setup_root)
+                || fqcn.ends_with("\\Interceptor")
+            {
+                return false;
+            }
+            let mut seen: FxHashSet<&str> = FxHashSet::default();
+            let mut stack: Vec<&str> = vec![fqcn.as_str()];
+            let mut plugins = false;
+            while let Some(name) = stack.pop() {
+                if !seen.insert(name) {
+                    continue;
+                }
+                plugins |= has_plugins(name);
+                // `Config::_inheritInterception()` does not look past a class named Interceptor.
+                if name.rsplit('\\').next() == Some("Interceptor") {
+                    continue;
+                }
+                if let Some(parent) = lookup.get(name) {
+                    stack.extend(parent.extends.iter().map(|n| n.trim_start_matches('\\')));
+                    stack.extend(parent.implements.iter().map(|n| n.trim_start_matches('\\')));
+                }
+            }
+            plugins
+                && !seen.contains("Magento\\Framework\\ObjectManager\\NoninterceptableInterface")
+        })
+        .map(|(fqcn, _)| fqcn)
+        .collect();
+    found.sort();
+    found.first().map(|fqcn| fqcn.to_string())
 }
 
 const GENERATED_CLASS_SUFFIXES: &[&str] = &[
