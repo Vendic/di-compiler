@@ -366,18 +366,51 @@ fn merged_di_arguments_for_type_name(
         let chain = virtual_type_chain(ancestor, di_config);
         for current in chain.iter().rev() {
             for arg in di_config.get_arguments(current) {
-                let name = argument_name(arg).to_string();
+                let arg = with_items_sorted_as_read(arg);
+                let name = argument_name(&arg).to_string();
                 if let Some(idx) = by_name.get(&name).copied() {
-                    merge_argument_into(&mut merged[idx], arg);
+                    merge_argument_into(&mut merged[idx], &arg);
                 } else {
                     by_name.insert(name, merged.len());
-                    merged.push(arg.clone());
+                    merged.push(arg);
                 }
             }
         }
     }
 
     merged
+}
+
+/// `ArrayType::evaluate()` sorts array items when it reads the merged di.xml of one scope, and
+/// leaves no `sortOrder` behind. So what a type inherits later keeps this order, and the new items
+/// of a child go last. Items with equal `sortOrder` keep their order.
+fn with_items_sorted_as_read(arg: &Argument) -> Argument {
+    let mut arg = arg.clone();
+    sort_items_as_read(&mut arg);
+    arg
+}
+
+fn sort_items_as_read(arg: &mut Argument) {
+    if let Argument::Array { items, .. } = arg {
+        items.sort_by_key(argument_sort_order);
+        for item in items.iter_mut() {
+            sort_items_as_read(item);
+            clear_sort_order(item);
+        }
+    }
+}
+
+fn clear_sort_order(arg: &mut Argument) {
+    match arg {
+        Argument::Object { sort_order, .. }
+        | Argument::String { sort_order, .. }
+        | Argument::Boolean { sort_order, .. }
+        | Argument::Number { sort_order, .. }
+        | Argument::Null { sort_order, .. }
+        | Argument::Array { sort_order, .. }
+        | Argument::Init { sort_order, .. }
+        | Argument::Const { sort_order, .. } => *sort_order = 0,
+    }
 }
 
 /// Merge `src` into `dst`.
