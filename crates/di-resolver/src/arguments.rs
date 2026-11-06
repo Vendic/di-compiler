@@ -147,7 +147,8 @@ pub fn resolve_for_class(
         // 2) required typed param => instance argument
         // 3) fallback => null
         let value = if param.is_variadic {
-            ResolvedArgValue::Null
+            // `ClassReader::getReflectionParameterDefaultValue()` gives a variadic `[]`.
+            ResolvedArgValue::PlainArray(Vec::new())
         } else if param.is_optional {
             resolve_non_object_default(param.default_value.as_deref(), const_map)
         } else if let Some(type_hint) = param.type_hint.as_deref().and_then(parameter_class) {
@@ -1420,6 +1421,31 @@ mod tests {
             by_name.get("csrf_validator").copied(),
             Some(ResolvedArgValue::SharedInstance(v))
             if v == "Magento\\Backend\\App\\Request\\BackendValidator"
+        ));
+    }
+
+    #[test]
+    fn test_variadic_parameter_gets_an_empty_array() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class_with_constructor(
+                "App\\Service",
+                vec![ConstructorParam {
+                    name: "rest".to_string(),
+                    type_hint: Some("App\\Dep".to_string()),
+                    is_optional: true,
+                    default_value: None,
+                    is_primitive: false,
+                    is_variadic: true,
+                    is_promoted: false,
+                }],
+            ),
+        );
+        let map = resolve_all_arguments(&class_map, &DiConfig::default(), &FxHashMap::default());
+        assert!(matches!(
+            &map["App\\Service"][0].resolved,
+            ResolvedArgValue::PlainArray(items) if items.is_empty()
         ));
     }
 
