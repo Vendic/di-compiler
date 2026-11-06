@@ -383,6 +383,21 @@ fn collect_di_xml_files(
         }
     }
 
+    // Modules that Composer registers from a folder the search above skips.
+    let found: FxHashSet<std::path::PathBuf> = paths.iter().map(|(_, _, p)| p.clone()).collect();
+    for module_root in composer_registered_module_roots(magento_root) {
+        let module_idx = cached_module_name(&module_root)
+            .and_then(|n| module_order.get(&n).copied())
+            .unwrap_or(usize::MAX);
+        let mut module_paths = Vec::new();
+        push_module_di_paths(&module_root, 1, module_idx, area, &mut module_paths);
+        paths.extend(
+            module_paths
+                .into_iter()
+                .filter(|(_, _, path)| !found.contains(path)),
+        );
+    }
+
     // app/code/*/*/etc/di.xml
     if let Ok(vendors) = std::fs::read_dir(magento_root.join("app/code")) {
         for vendor in vendors.flatten() {
@@ -409,6 +424,24 @@ fn collect_di_xml_files(
     // Sort by (priority, module_idx, path) for deterministic Magento-order merging
     paths.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     paths.into_iter().map(|(_, _, p)| p).collect()
+}
+
+/// The folders of the `registration.php` files in `vendor/composer/autoload_files.php`.
+/// Composer loads these on every request, which is how Magento learns about these modules.
+pub fn composer_registered_module_roots(magento_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let vendor = magento_root.join("vendor");
+    let Ok(list) = std::fs::read_to_string(vendor.join("composer/autoload_files.php")) else {
+        return Vec::new();
+    };
+    list.lines()
+        .filter_map(|line| {
+            let (_, path) = line.split_once("$vendorDir . '/")?;
+            let (path, _) = path.split_once('\'')?;
+            path.strip_suffix("/registration.php")
+        })
+        .map(|package_path| vendor.join(package_path))
+        .filter(|module_root| module_root.is_dir())
+        .collect()
 }
 
 fn normalize(s: &str) -> String {

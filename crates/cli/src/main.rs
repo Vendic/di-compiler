@@ -42,9 +42,9 @@ use di_resolver::{
     resolve_all_arguments, resolve_all_arguments_for_named_types, FactorySpec,
 };
 use di_xml_reader::{
-    apply_module_config_on_primary, find_all_di_xml_files, find_di_xml_files,
-    find_di_xml_files_for_area, merge_configs, merge_into, parse_di_xml_unfolded, Argument,
-    DiConfig, Plugin,
+    apply_module_config_on_primary, composer_registered_module_roots, find_all_di_xml_files,
+    find_di_xml_files, find_di_xml_files_for_area, merge_configs, merge_into,
+    parse_di_xml_unfolded, Argument, DiConfig, Plugin,
 };
 use php_extractor::{
     extract_file, extract_file_with_class_check, extract_string_constants,
@@ -505,8 +505,12 @@ fn main() {
     // -----------------------------------------------------------------------
     let phase_1_2_started = Instant::now();
     let enabled_modules = load_module_order_from_config_php(&magento_root);
+    let mut all_module_paths = read_module_paths(&magento_root);
+    all_module_paths.extend(composer_registered_module_roots(&magento_root));
+    all_module_paths.sort();
+    all_module_paths.dedup();
     let (module_paths, disabled_module_paths) =
-        split_disabled_modules(read_module_paths(&magento_root), &enabled_modules);
+        split_disabled_modules(all_module_paths, &enabled_modules);
     let php_files = walk_php_files(&module_paths);
     log::info!("Found {} PHP files", php_files.len());
 
