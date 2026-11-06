@@ -159,7 +159,7 @@ pub fn parse_di_xml_bytes_unfolded(content: &[u8]) -> Result<DiConfig, Error> {
                         let ctx = ArgContext {
                             name: arg_name,
                             xsi_type,
-                            shared: None,
+                            shared: attrs.get("shared").map(|s| s != "false"),
                             sort_order,
                             text: String::new(),
                             items: Vec::new(),
@@ -279,7 +279,7 @@ pub fn parse_di_xml_bytes_unfolded(content: &[u8]) -> Result<DiConfig, Error> {
                         arg_stack.push(ArgContext {
                             name: arg_name,
                             xsi_type,
-                            shared: None,
+                            shared: attrs.get("shared").map(|s| s != "false"),
                             sort_order,
                             text: String::new(),
                             items: Vec::new(),
