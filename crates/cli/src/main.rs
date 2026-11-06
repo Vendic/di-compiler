@@ -441,7 +441,9 @@ fn main() {
     // Phase 1 + 2: Walk PHP files + extract ClassInfo (parallel)
     // -----------------------------------------------------------------------
     let phase_1_2_started = Instant::now();
-    let module_paths = read_module_paths(&magento_root);
+    let enabled_modules = load_module_order_from_config_php(&magento_root);
+    let (module_paths, disabled_module_paths) =
+        split_disabled_modules(read_module_paths(&magento_root), &enabled_modules);
     let php_files = walk_php_files(&module_paths);
     log::info!("Found {} PHP files", php_files.len());
 
@@ -489,6 +491,15 @@ fn main() {
         })
         .collect();
     pb.finish_with_message("done");
+
+    // Not compiled, but enabled code can still name these classes or extend them.
+    let disabled_class_map: FxHashMap<String, ClassInfo> = walk_php_files(&disabled_module_paths)
+        .par_iter()
+        .filter_map(|path| match extract_file(path) {
+            ExtractResult::Ok(info) => Some((info.fqcn.clone(), info)),
+            _ => None,
+        })
+        .collect();
 
     let classes_asked_for_by_files = run_file_level_checks(
         &mut class_map,
@@ -543,7 +554,6 @@ fn main() {
     // Phase 3a: Parse + merge global di.xml files (for per-area metadata)
     // -----------------------------------------------------------------------
     let phase_3a_started = Instant::now();
-    let enabled_modules = load_module_order_from_config_php(&magento_root);
     let di_xml_files = filter_enabled_di_xml(
         find_di_xml_files(&magento_root, &enabled_modules),
         &enabled_modules,
@@ -672,6 +682,10 @@ fn main() {
             if class_map.contains_key(&target) {
                 continue;
             }
+            if disabled_class_map.contains_key(&target) {
+                extra_existing_proxy_targets.insert(target);
+                continue;
+            }
             // Keep Magento namespace existence tied to scanned ClassInfo scope.
             // Composer fallback is for third-party/autoload-only targets (e.g. PSR).
             if target.starts_with("Magento\\") {
@@ -700,6 +714,7 @@ fn main() {
         .collect();
     let source_exists = |fqcn: &str| {
         class_map.contains_key(fqcn)
+            || disabled_class_map.contains_key(fqcn)
             || composer_autoload
                 .as_ref()
                 .is_some_and(|index| index.is_loadable(fqcn))
@@ -728,6 +743,7 @@ fn main() {
     if let Some(index) = &composer_autoload {
         factories.retain(|spec| !index.is_loadable(&spec.factory_fqcn));
     }
+    factories.retain(|spec| !disabled_class_map.contains_key(&spec.factory_fqcn));
     let proxies = detect_proxies_from_configs_with_existing(
         &class_map,
         &scanner_di_configs,
@@ -771,11 +787,14 @@ fn main() {
     // Magento\Setup\...\EntityGeneratorFactory). Magento sees those classes
     // after factory generation; mirror that by adding synthetic class metadata
     // before interceptor detection.
+    let disabled_ancestors = collect_disabled_ancestors(&class_map, &disabled_class_map);
     let mut interception_class_map = class_map.clone();
+    interception_class_map.extend(disabled_ancestors.clone());
     augment_with_composer_plugin_owner_classes(
         &mut interception_class_map,
         &interception_di_config,
         composer_autoload.as_ref(),
+        &disabled_class_map,
     );
     for spec in &factories {
         if interception_class_map.contains_key(&spec.factory_fqcn) {
@@ -1246,7 +1265,7 @@ fn main() {
         // source concrete classes, not for generated artifacts (interceptors, factories, proxies).
         let base_class_fqcns: FxHashSet<String> = interception_class_map.keys().cloned().collect();
         // Wrap in Arc so the area par_iter loop shares it without cloning 25K strings per area.
-        let argument_type_names = std::sync::Arc::new(build_argument_type_names(
+        let mut argument_type_names = build_argument_type_names(
             &interception_class_map,
             &generated_class_map,
             &metadata_base_di_config,
@@ -1256,8 +1275,14 @@ fn main() {
             &search_results,
             &proxy_deferred,
             &extension_specs,
-        ));
-        let interception_type_names = build_interception_type_names(
+        );
+        // ClassesScanner never lists these, so Magento gives them no arguments entry.
+        argument_type_names.retain(|name| {
+            let class = name.strip_suffix("\\Interceptor").unwrap_or(name);
+            class_map.contains_key(class) || !disabled_class_map.contains_key(class)
+        });
+        let argument_type_names = std::sync::Arc::new(argument_type_names);
+        let mut interception_type_names = build_interception_type_names(
             &interception_class_map,
             &generated_class_map,
             &metadata_base_di_config,
@@ -1267,6 +1292,15 @@ fn main() {
             &search_results,
             &proxy_deferred,
             &extension_specs,
+        );
+        // `Config::generateIntercepted()` marks every plugin owner in every scope, even
+        // when the owner's module is disabled.
+        interception_type_names.extend(
+            interception_di_config
+                .plugins
+                .keys()
+                .filter(|owner| disabled_class_map.contains_key(*owner))
+                .cloned(),
         );
         // All three reflection passes merged into one par_iter — eliminates two
         // Rayon barriers. Candidates are disjoint: pass 1 has constructors with
@@ -1625,6 +1659,9 @@ fn main() {
 
         // Scope-specific plugin-list metadata files.
         let plugin_list_class_definitions: Vec<String> = Vec::new();
+        // PluginList follows the parents of every plugin owner, wherever the owner lives.
+        let mut plugin_list_class_map = disabled_class_map.clone();
+        plugin_list_class_map.extend(class_map.clone());
         let plugin_scopes = [
             "global",
             "adminhtml",
@@ -1647,7 +1684,7 @@ fn main() {
                 let t_scope = Instant::now();
                 let metadata = compile_plugin_list(
                     scope_di_config,
-                    &class_map,
+                    &plugin_list_class_map,
                     &plugin_list_class_definitions,
                     include_vt,
                 );
@@ -3013,7 +3050,12 @@ if ($root === '' || !is_file($root . '/app/bootstrap.php')) {
 }
 require $root . '/app/bootstrap.php';
 $registrar = new \Magento\Framework\Component\ComponentRegistrar();
-$modules = array_values($registrar->getPaths(\Magento\Framework\Component\ComponentRegistrar::MODULE));
+$statuses = (@include $root . '/app/etc/config.php')['modules'] ?? [];
+$modules = array_values(array_filter(
+    $registrar->getPaths(\Magento\Framework\Component\ComponentRegistrar::MODULE),
+    fn ($module) => ($statuses[$module] ?? 0) === 1,
+    ARRAY_FILTER_USE_KEY
+));
 $libraries = array_values($registrar->getPaths(\Magento\Framework\Component\ComponentRegistrar::LIBRARY));
 $setupPath = (new \Magento\Framework\App\Filesystem\DirectoryList($root))
     ->getPath(\Magento\Framework\App\Filesystem\DirectoryList::SETUP);
@@ -4523,6 +4565,7 @@ fn augment_with_composer_plugin_owner_classes(
     class_map: &mut FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
     composer_index: Option<&ComposerAutoloadIndex>,
+    disabled_class_map: &FxHashMap<String, ClassInfo>,
 ) {
     let Some(index) = composer_index else {
         return;
@@ -4553,7 +4596,8 @@ fn augment_with_composer_plugin_owner_classes(
     }
 
     for fqcn in candidates {
-        if class_map.contains_key(&fqcn) {
+        // Magento only intercepts classes it scanned, or parents of those.
+        if class_map.contains_key(&fqcn) || disabled_class_map.contains_key(&fqcn) {
             continue;
         }
         let Some(path) = index.resolve_class_path(&fqcn) else {
@@ -5569,6 +5613,58 @@ fn module_root_from_di_xml(di_xml: &Path) -> Option<&Path> {
 /// TKT-051: explicit denylist prevents accidental inclusion of testing frameworks
 /// that may have a `registration.php` but are not production Magento modules.
 const EXCLUDED_PACKAGES: &[&str] = &["magento2-functional-testing-framework", "mftf"];
+
+/// Split the discovered paths into what the compiler scans and disabled modules.
+///
+/// `DiCompileCommand::execute()` compiles a module only when its status in
+/// `app/etc/config.php` is 1, so a module with status 0 or no status is out.
+/// Libraries, themes and the setup directory have no status and stay in the scan.
+/// A package can register as a library and still ship `etc/module.xml`.
+fn split_disabled_modules(
+    module_paths: Vec<PathBuf>,
+    enabled_modules: &FxHashMap<String, usize>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    // An unreadable config.php is no reason to compile nothing.
+    if enabled_modules.is_empty() {
+        return (module_paths, Vec::new());
+    }
+    module_paths.into_iter().partition(|path| {
+        read_module_name_from_module_xml(path)
+            .is_none_or(|name| enabled_modules.contains_key(&name))
+            || std::fs::read_to_string(path.join("registration.php"))
+                .is_ok_and(|registration| registration.contains("::LIBRARY"))
+    })
+}
+
+/// Classes from disabled modules that a scanned class inherits from.
+///
+/// Magento loads these through the autoloader while it scans. `PluginList` walks
+/// each intercepted class up through its parents, so a concrete parent with plugins
+/// gets an Interceptor even when its own module is disabled.
+fn collect_disabled_ancestors(
+    class_map: &FxHashMap<String, ClassInfo>,
+    disabled_class_map: &FxHashMap<String, ClassInfo>,
+) -> FxHashMap<String, ClassInfo> {
+    let parents_of = |info: &ClassInfo| -> Vec<String> {
+        info.extends
+            .iter()
+            .chain(info.implements.iter())
+            .map(|name| name.trim_start_matches('\\').to_string())
+            .collect()
+    };
+    let mut pending: Vec<String> = class_map.values().flat_map(&parents_of).collect();
+    let mut ancestors: FxHashMap<String, ClassInfo> = FxHashMap::default();
+    while let Some(name) = pending.pop() {
+        if class_map.contains_key(&name) || ancestors.contains_key(&name) {
+            continue;
+        }
+        if let Some(info) = disabled_class_map.get(&name) {
+            pending.extend(parents_of(info));
+            ancestors.insert(name, info.clone());
+        }
+    }
+    ancestors
+}
 
 /// Filter a list of di.xml paths, dropping files from disabled modules.
 ///
