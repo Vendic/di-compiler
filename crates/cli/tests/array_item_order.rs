@@ -1,7 +1,8 @@
 //! `Data\Argument\Interpreter\ArrayType::evaluate()` sorts the items of an array when it reads the
-//! merged di.xml of one scope, and the `sortOrder` is gone after that. `Config::_collectConfiguration()`
-//! then merges parent and child with `array_replace_recursive`: the parent's order stays, and new
-//! items of the child go last, whatever their `sortOrder`.
+//! merged di.xml of one scope. `Config::_collectConfiguration()` then merges parent and child with
+//! `array_replace_recursive`, so new items of the child go last, and calls `SortItems::sortItems()`
+//! after each merge. That call only sorts when the last item of the last array argument has a
+//! `sortOrder`. Only object items keep that value, because `Interpreter\DataObject` copies it.
 
 use std::fs;
 use std::path::Path;
@@ -167,5 +168,43 @@ fn later_file_without_sort_order_keeps_the_sort_order_of_an_earlier_file() {
         &metadata(root),
         "Acme\\\\On\\\\Model\\\\Base",
         &["stays", "moved"],
+    ));
+}
+
+const TAKES_TWO: &str = "class Base\n{\n    public function __construct(array $things = [], array $helpers = [])\n    {\n    }\n}";
+
+const PARENT_WITH_TWO: &str = "<type name=\"Acme\\On\\Model\\Base\"><arguments><argument name=\"things\" xsi:type=\"array\">\n<item name=\"late\" sortOrder=\"900\" xsi:type=\"object\">Acme\\On\\Model\\Base</item>\n</argument>\n<argument name=\"helpers\" xsi:type=\"array\">\n<item name=\"helper\" sortOrder=\"10\" xsi:type=\"object\">Acme\\On\\Model\\Base</item>\n</argument></arguments></type>";
+
+#[test]
+fn child_items_with_a_sort_order_sort_with_the_parent_when_the_last_item_has_one() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    class(root, "Base", TAKES_TWO);
+    class(root, "Child", "class Child extends Base\n{\n}");
+    compile(
+        root,
+        &format!("{PARENT_WITH_TWO}\n<type name=\"Acme\\On\\Model\\Child\"><arguments><argument name=\"things\" xsi:type=\"array\">\n<item name=\"early\" sortOrder=\"200\" xsi:type=\"object\">Acme\\On\\Model\\Base</item>\n</argument></arguments></type>"),
+    );
+    assert_in_order(item_order(
+        &metadata(root),
+        "Acme\\\\On\\\\Model\\\\Child",
+        &["early", "late"],
+    ));
+}
+
+#[test]
+fn child_item_without_a_sort_order_stays_last_when_it_is_the_last_item() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    class(root, "Base", TAKES_TWO);
+    class(root, "Child", "class Child extends Base\n{\n}");
+    compile(
+        root,
+        &format!("{PARENT_WITH_TWO}\n<type name=\"Acme\\On\\Model\\Child\"><arguments><argument name=\"things\" xsi:type=\"array\">\n<item name=\"own\" xsi:type=\"object\">Acme\\On\\Model\\Base</item>\n</argument></arguments></type>"),
+    );
+    assert_in_order(item_order(
+        &metadata(root),
+        "Acme\\\\On\\\\Model\\\\Child",
+        &["late", "own"],
     ));
 }
