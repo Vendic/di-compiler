@@ -12,6 +12,16 @@ use crate::types::{
 
 pub struct Lexer;
 
+/// What the scan of a class file saw around the class declaration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanFacts {
+    /// A `class_exists()` or sibling comes before the declaration.
+    pub class_check: bool,
+    /// The declaration is inside a block, such as `if`. A braced namespace does not count.
+    /// `FileClassScanner::extract()` does not see such a class.
+    pub inside_block: bool,
+}
+
 impl Lexer {
     pub fn extract(path: &Path) -> Result<ClassInfo, LexError> {
         Self::extract_with_class_check(path).map(|(info, _)| info)
@@ -20,10 +30,19 @@ impl Lexer {
     /// Also says whether the file calls `class_exists()` or a sibling before the
     /// class declaration. Such a file only gives a final answer when PHP runs it.
     pub fn extract_with_class_check(path: &Path) -> Result<(ClassInfo, bool), LexError> {
+        Self::extract_with_facts(path).map(|(info, facts)| (info, facts.class_check))
+    }
+
+    /// Also says what the scan of the file saw around the class declaration.
+    pub fn extract_with_facts(path: &Path) -> Result<(ClassInfo, ScanFacts), LexError> {
         let bytes = std::fs::read(path)?;
         let mut s = Scanner::new(&bytes);
         let info = s.extract_class(path)?;
-        Ok((info, s.class_check_seen))
+        let facts = ScanFacts {
+            class_check: s.class_check_seen,
+            inside_block: s.block_depth > 0,
+        };
+        Ok((info, facts))
     }
 
     /// Reads the declaration on a 1-based line, for a file that declares a class
@@ -67,6 +86,8 @@ struct Scanner<'a> {
     class_check_seen: bool,
     /// Class declarations before this byte offset are skipped.
     declaration_from: usize,
+    /// Open braces before the class declaration, not counting a braced namespace.
+    block_depth: u32,
 }
 
 impl<'a> Scanner<'a> {
@@ -78,6 +99,7 @@ impl<'a> Scanner<'a> {
             use_map: rustc_hash::FxHashMap::default(),
             class_check_seen: false,
             declaration_from: 0,
+            block_depth: 0,
         }
     }
 
@@ -265,6 +287,11 @@ impl<'a> Scanner<'a> {
             }
             let b = self.peek();
             if !is_word_start(b) {
+                match b {
+                    b'{' => self.block_depth += 1,
+                    b'}' => self.block_depth = self.block_depth.saturating_sub(1),
+                    _ => {}
+                }
                 self.advance(1);
                 continue;
             }

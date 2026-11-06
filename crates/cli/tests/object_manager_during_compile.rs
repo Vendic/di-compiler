@@ -238,7 +238,7 @@ fn plugin_class_that_uses_the_object_manager_while_it_loads_compiles() {
 
 #[test]
 fn class_file_with_a_class_check_declares_the_branch_the_object_manager_picks() {
-    let source = "<?php\nnamespace Acme\\On\\Model;\n\nif (class_exists('Acme\\\\On\\\\Model\\\\Nothing') || \\Magento\\Framework\\App\\ObjectManager::getInstance()->get('Known')->answer() !== 'yes') {\n    class Thing\n    {\n        public function __construct(int $first)\n        {\n        }\n    }\n} else {\n    class Thing\n    {\n        public function __construct(string $second = 'x')\n        {\n        }\n    }\n}\n";
+    let source = "<?php\nnamespace Acme\\On\\Model;\n\nif (class_exists('Acme\\\\On\\\\Model\\\\Nothing') || \\Magento\\Framework\\App\\ObjectManager::getInstance()->get('Known')->answer() !== 'yes'):\n    class Thing\n    {\n        public function __construct(int $first)\n        {\n        }\n    }\nelse:\n    class Thing\n    {\n        public function __construct(string $second = 'x')\n        {\n        }\n    }\nendif;\n";
     let Some((output, tmp)) = compile(&[(THING, source)], Some("")) else {
         return;
     };
