@@ -62,13 +62,17 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         let name = normalize(&attrs.get("name").cloned().unwrap_or_default());
                         let type_name = normalize(&attrs.get("type").cloned().unwrap_or_default());
                         if !name.is_empty() {
-                            config.virtual_types.insert(
-                                name.clone(),
-                                VirtualType {
-                                    name: name.clone(),
-                                    type_name,
-                                },
-                            );
+                            // Magento's Mapper\Dom sets `type` only when the attribute exists.
+                            // Without it the entry only holds settings for the named class.
+                            if !type_name.is_empty() {
+                                config.virtual_types.insert(
+                                    name.clone(),
+                                    VirtualType {
+                                        name: name.clone(),
+                                        type_name,
+                                    },
+                                );
+                            }
                             let entry = config.type_configs.entry(name).or_default();
                             if let Some(shared_str) = attrs.get("shared") {
                                 entry.shared = Some(shared_str != "false");
@@ -185,13 +189,17 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         if !name.is_empty() {
                             current_virtual = Some(name.clone());
                             current_type = None;
-                            config.virtual_types.insert(
-                                name.clone(),
-                                VirtualType {
-                                    name: name.clone(),
-                                    type_name,
-                                },
-                            );
+                            // Magento's Mapper\Dom sets `type` only when the attribute exists.
+                            // Without it the entry only holds settings for the named class.
+                            if !type_name.is_empty() {
+                                config.virtual_types.insert(
+                                    name.clone(),
+                                    VirtualType {
+                                        name: name.clone(),
+                                        type_name,
+                                    },
+                                );
+                            }
                             let entry = config.type_configs.entry(name).or_default();
                             if let Some(shared_str) = attrs.get("shared") {
                                 entry.shared = Some(shared_str != "false");
@@ -525,6 +533,50 @@ mod tests {
             config.virtual_types["MyVirtual"].type_name,
             "Concrete\\Class"
         );
+    }
+
+    #[test]
+    fn test_virtual_type_without_type_is_only_a_type_config() {
+        let xml = br#"<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <virtualType name="Acme\RealClass" shared="false">
+        <arguments>
+            <argument name="path" xsi:type="string">some/path</argument>
+        </arguments>
+    </virtualType>
+    <virtualType name="Acme\SelfClosing"/>
+</config>"#;
+        let config = parse_di_xml_bytes(xml).unwrap();
+
+        assert!(!config.virtual_types.contains_key("Acme\\RealClass"));
+        assert!(!config.virtual_types.contains_key("Acme\\SelfClosing"));
+        let type_config = &config.type_configs["Acme\\RealClass"];
+        assert_eq!(type_config.arguments.len(), 1);
+        assert_eq!(type_config.shared, Some(false));
+    }
+
+    #[test]
+    fn test_virtual_type_without_type_keeps_type_from_earlier_scope() {
+        let global = parse_di_xml_bytes(
+            br#"<config><virtualType name="Acme\Virtual" type="Acme\Base"/></config>"#,
+        )
+        .unwrap();
+        let area = parse_di_xml_bytes(
+            br#"<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <virtualType name="Acme\Virtual">
+        <arguments><argument name="path" xsi:type="string">area</argument></arguments>
+    </virtualType>
+</config>"#,
+        )
+        .unwrap();
+
+        let merged = crate::merger::apply_module_config_on_primary(global, area);
+
+        assert_eq!(
+            merged.virtual_types["Acme\\Virtual"].type_name,
+            "Acme\\Base"
+        );
+        assert_eq!(merged.type_configs["Acme\\Virtual"].arguments.len(), 1);
     }
 
     #[test]
