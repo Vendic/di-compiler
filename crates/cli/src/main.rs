@@ -551,7 +551,7 @@ fn main() {
     // Phase 1 + 2: Walk PHP files + extract ClassInfo (parallel)
     // -----------------------------------------------------------------------
     let phase_1_2_started = Instant::now();
-    let enabled_modules = load_module_order_from_config_php(&magento_root);
+    let enabled_modules = load_module_order_from_config_php(&magento_root, &args.fallback_php);
     let mut all_module_paths = read_module_paths(&magento_root);
     all_module_paths.extend(composer_registered_module_roots(&magento_root));
     let mut all_module_paths: Vec<PathBuf> = all_module_paths
@@ -786,7 +786,8 @@ fn main() {
     // Phase 3c: Collect extension-attributes metadata (for Extension* artifacts)
     // -----------------------------------------------------------------------
     let phase_3c_started = Instant::now();
-    let extension_attr_files = find_extension_attributes_files(&magento_root, &module_paths);
+    let extension_attr_files =
+        find_extension_attributes_files(&magento_root, &module_paths, &args.fallback_php);
     let extension_attr_map = parse_extension_attributes_files(&extension_attr_files);
     let extension_specs = collect_extension_specs(&class_map, &extension_attr_map);
     log_phase_elapsed("Phase 3c", phase_3c_started);
@@ -5482,11 +5483,15 @@ fn plugin_list_cache_id(scope: &str) -> String {
     }
 }
 
-fn find_extension_attributes_files(magento_root: &Path, module_paths: &[PathBuf]) -> Vec<PathBuf> {
+fn find_extension_attributes_files(
+    magento_root: &Path,
+    module_paths: &[PathBuf],
+    php_bin: &str,
+) -> Vec<PathBuf> {
     // Magento composes XML by module load order (app/etc/config.php), not by
     // filesystem path order. Preserve that so generated Extension* method order
     // matches PHP compile output.
-    let module_order = load_module_order_from_config_php(magento_root);
+    let module_order = load_module_order_from_config_php(magento_root, php_bin);
     let mut ordered_files: Vec<(usize, usize, PathBuf)> = Vec::new();
     for (discovery_idx, module_path) in module_paths.iter().enumerate() {
         let file = module_path.join("etc/extension_attributes.xml");
@@ -5557,7 +5562,41 @@ fn bootstrap_php_constants(php_bin: &str, magento_root: &Path) -> FxHashMap<Stri
     serde_json::from_slice(&out.stdout).unwrap_or_default()
 }
 
-fn load_module_order_from_config_php(magento_root: &Path) -> FxHashMap<String, usize> {
+/// The enabled modules, with their position in `app/etc/config.php`. PHP reads the file, because
+/// `DeploymentConfig` includes it, so any valid PHP counts. A disabled module also takes a position,
+/// so that when two modules have equal DI priority the module later in the file wins (TKT-048).
+fn load_module_order_from_config_php(
+    magento_root: &Path,
+    php_bin: &str,
+) -> FxHashMap<String, usize> {
+    let script = r#"
+$config = @include $argv[1] . '/app/etc/config.php';
+$rows = [];
+foreach (is_array($config) ? $config['modules'] ?? [] : [] as $module => $status) {
+    $rows[] = [$module, $status === 1];
+}
+echo json_encode($rows);
+"#;
+    let answer = Command::new(php_bin)
+        .args(["-d", "display_errors=0", "-r", script, "--"])
+        .arg(magento_root)
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<Vec<(String, bool)>>(&output.stdout).ok());
+    match answer {
+        Some(rows) => rows
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (_, enabled))| *enabled)
+            .map(|(position, (module, _))| (module, position))
+            .collect(),
+        None => read_module_order_without_php(magento_root),
+    }
+}
+
+fn read_module_order_without_php(magento_root: &Path) -> FxHashMap<String, usize> {
     let mut out = FxHashMap::default();
     let config_php = magento_root.join("app/etc/config.php");
     let Ok(content) = std::fs::read_to_string(config_php) else {
