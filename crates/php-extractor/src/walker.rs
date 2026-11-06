@@ -210,10 +210,19 @@ fn collect_php_files(root: &Path, kind: Option<ComponentKind>) -> Vec<PathBuf> {
     let php_types = types_builder.select("php").build().unwrap();
 
     let mut builder = WalkBuilder::new(root);
+    // `ClassesScanner` knows no ignore files and walks into folders that start with a dot.
+    builder.standard_filters(false);
     builder.types(php_types);
     let walk_root = root.to_path_buf();
     builder.filter_entry(move |entry| {
         if entry.file_name() == "magento2-functional-testing-framework" {
+            return false;
+        }
+        // `ClassesScanner::extract()` skips only files that start with a dot.
+        let is_dir = entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir());
+        if !is_dir && entry.file_name().as_encoded_bytes().starts_with(b".") {
             return false;
         }
         match (kind, entry.path().strip_prefix(&walk_root)) {
@@ -349,6 +358,68 @@ mod tests {
         let files = walk_generated_php_files(root);
 
         assert_eq!(files.len(), 2);
+    }
+
+    /// `ClassesScanner::getList()` uses a plain `RecursiveDirectoryIterator`. It knows
+    /// nothing of git, so a class hidden from git is still a class.
+    #[test]
+    fn ignore_files_do_not_hide_classes() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path();
+        fs::create_dir_all(store.join(".git/info")).unwrap();
+        fs::write(store.join(".git/info/exclude"), "Excluded/\n").unwrap();
+        fs::write(store.join(".gitignore"), "StoreIgnored/\n").unwrap();
+        let module = store.join("app/code/Acme/On");
+        touch(&module, "registration.php");
+        fs::write(module.join(".gitignore"), "Model/\n").unwrap();
+        fs::write(module.join(".ignore"), "Api/\n").unwrap();
+        touch(&module, "Model/Hidden.php");
+        touch(&module, "Api/Hidden.php");
+        touch(&module, "Excluded/Hidden.php");
+        touch(&module, "StoreIgnored/Hidden.php");
+
+        let files = walk_php_files(std::slice::from_ref(&module));
+
+        assert_eq!(
+            names(&files, &module),
+            [
+                "Api/Hidden.php",
+                "Excluded/Hidden.php",
+                "Model/Hidden.php",
+                "StoreIgnored/Hidden.php",
+                "registration.php",
+            ]
+        );
+    }
+
+    /// `ClassesScanner::extract()` skips a file whose name starts with a dot, and nothing
+    /// else. The iterator walks into folders whose name starts with a dot.
+    #[test]
+    fn dot_files_are_skipped_and_dot_folders_are_read() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        touch(root, "registration.php");
+        touch(root, ".php-cs-fixer.php");
+        touch(root, ".ci/Tool.php");
+        touch(root, ".ci/.hidden.php");
+
+        let files = walk_php_files(&[root.to_path_buf()]);
+
+        assert_eq!(names(&files, root), [".ci/Tool.php", "registration.php"]);
+    }
+
+    #[test]
+    fn generated_code_ignores_ignore_files_too() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path();
+        fs::create_dir_all(store.join(".git")).unwrap();
+        let code = store.join("generated/code");
+        touch(&code, "Acme/Foo/Interceptor.php");
+        fs::write(code.join(".gitignore"), "Acme/\n").unwrap();
+
+        let files = walk_generated_php_files(&code);
+
+        assert_eq!(names(&files, &code), ["Acme/Foo/Interceptor.php"]);
     }
 
     #[test]
