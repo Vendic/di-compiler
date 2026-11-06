@@ -13,8 +13,29 @@ pub struct Lexer;
 
 impl Lexer {
     pub fn extract(path: &Path) -> Result<ClassInfo, LexError> {
+        Self::extract_with_class_check(path).map(|(info, _)| info)
+    }
+
+    /// Also says whether the file calls `class_exists()` or a sibling before the
+    /// class declaration. Such a file only gives a final answer when PHP runs it.
+    pub fn extract_with_class_check(path: &Path) -> Result<(ClassInfo, bool), LexError> {
         let bytes = std::fs::read(path)?;
         let mut s = Scanner::new(&bytes);
+        let info = s.extract_class(path)?;
+        Ok((info, s.class_check_seen))
+    }
+
+    /// Reads the declaration on a 1-based line, for a file that declares a class
+    /// more than once and where PHP said which declaration it took.
+    pub fn extract_declared_at(path: &Path, line: usize) -> Result<ClassInfo, LexError> {
+        let bytes = std::fs::read(path)?;
+        let mut s = Scanner::new(&bytes);
+        s.declaration_from = bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == b'\n')
+            .nth(line.saturating_sub(2))
+            .map_or(0, |(at, _)| at + 1);
         s.extract_class(path)
     }
 }
@@ -26,6 +47,10 @@ struct Scanner<'a> {
     namespace: String,
     /// File-level `use` imports: short alias → fully-qualified class name.
     use_map: rustc_hash::FxHashMap<String, String>,
+    /// A `class_exists()` or sibling was seen before the class declaration.
+    class_check_seen: bool,
+    /// Class declarations before this byte offset are skipped.
+    declaration_from: usize,
 }
 
 impl<'a> Scanner<'a> {
@@ -35,6 +60,8 @@ impl<'a> Scanner<'a> {
             pos: 0,
             namespace: String::new(),
             use_map: rustc_hash::FxHashMap::default(),
+            class_check_seen: false,
+            declaration_from: 0,
         }
     }
 
@@ -228,6 +255,18 @@ impl<'a> Scanner<'a> {
                 continue;
             }
             let word = self.read_word();
+            if is_class_check(word) {
+                self.class_check_seen = true;
+            }
+            let is_import =
+                word.eq_ignore_ascii_case(b"namespace") || word.eq_ignore_ascii_case(b"use");
+            if !is_import
+                && (self.pos <= self.declaration_from
+                    || self.follows_double_colon(self.pos - word.len()))
+            {
+                // `Foo::class` is a constant, not a declaration.
+                continue;
+            }
             match word {
                 b"namespace" => {
                     namespace = self.read_namespace_decl()?;
@@ -330,6 +369,10 @@ impl<'a> Scanner<'a> {
             is_final,
             public_methods,
         })
+    }
+
+    fn follows_double_colon(&self, at: usize) -> bool {
+        self.src[..at].trim_ascii_end().ends_with(b"::")
     }
 
     fn find_php_open_tag(&mut self) {
@@ -1319,6 +1362,17 @@ impl<'a> Scanner<'a> {
     }
 }
 
+fn is_class_check(word: &[u8]) -> bool {
+    [
+        &b"class_exists"[..],
+        b"interface_exists",
+        b"trait_exists",
+        b"enum_exists",
+    ]
+    .iter()
+    .any(|check| word.eq_ignore_ascii_case(check))
+}
+
 fn is_word_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
@@ -1370,6 +1424,66 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    fn temp_php(php: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(php.as_bytes()).unwrap();
+        f
+    }
+
+    #[test]
+    fn test_class_constant_before_the_declaration_does_not_hide_the_class() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nuse Bar\\DepFactory as Dep;\nif (class_exists(Dep::class)):\n    class Baz\n    {\n        public function __construct(Dep $dep) {}\n    }\nendif;\n",
+        )
+        .unwrap();
+        assert_eq!(info.fqcn, "Foo\\Baz");
+        let ctor = info.constructor.unwrap();
+        assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Bar\\DepFactory"));
+    }
+
+    #[test]
+    fn test_anonymous_class_before_the_declaration_still_stops_the_scan() {
+        assert!(extract_str("<?php\n$x = new class {};\nclass Foo {}\n").is_err());
+    }
+
+    #[test]
+    fn test_file_level_class_check_is_reported() {
+        for check in [
+            "class_exists",
+            "INTERFACE_exists",
+            "trait_exists",
+            "enum_exists",
+        ] {
+            let f = temp_php(&format!(
+                "<?php\nnamespace Foo;\nif ({check}('Bar')) {{ }}\nclass Baz {{}}\n"
+            ));
+            let (info, checked) = Lexer::extract_with_class_check(f.path()).unwrap();
+            assert_eq!(info.fqcn, "Foo\\Baz");
+            assert!(checked, "{check}");
+        }
+    }
+
+    #[test]
+    fn test_class_check_inside_a_method_is_not_a_file_level_check() {
+        let f = temp_php(
+            "<?php\nnamespace Foo;\nclass Baz\n{\n    public function run()\n    {\n        return class_exists('Bar');\n    }\n}\n",
+        );
+        let (_, checked) = Lexer::extract_with_class_check(f.path()).unwrap();
+        assert!(!checked);
+    }
+
+    #[test]
+    fn test_extract_declared_at_reads_the_declaration_on_that_line() {
+        let f = temp_php(
+            "<?php\nnamespace Foo;\nuse Bar\\Dep;\nif (class_exists(Dep::class)) {\n    class Baz\n    {\n        public function __construct(Dep $first) {}\n    }\n} else {\n    final class Baz extends Dep\n    {\n        public function __construct(Dep $second) {}\n    }\n}\n",
+        );
+        let info = Lexer::extract_declared_at(f.path(), 10).unwrap();
+        assert_eq!(info.fqcn, "Foo\\Baz");
+        assert!(info.is_final);
+        assert_eq!(info.extends.as_deref(), Some("Bar\\Dep"));
+        assert_eq!(info.constructor.unwrap().params[0].name, "second");
+    }
 
     fn extract_str(php: &str) -> Result<ClassInfo, LexError> {
         let mut f = NamedTempFile::new().unwrap();
