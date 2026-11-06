@@ -6648,7 +6648,14 @@ impl ComposerAutoloadIndex {
             if install_path.is_empty() {
                 continue;
             }
-            let package_root = base_dir.join(install_path);
+            // PHP does not read `install-path` to load a class. A package moved with its vendor
+            // folder still loads, so the path must not decide what the compiler can find.
+            let mut package_root = base_dir.join(install_path);
+            if !package_root.is_dir() {
+                if let Some(name) = pkg.get("name").and_then(serde_json::Value::as_str) {
+                    package_root = base_dir.join("..").join(name);
+                }
+            }
             let autoload = match pkg.get("autoload").and_then(serde_json::Value::as_object) {
                 Some(a) => a,
                 None => continue,
