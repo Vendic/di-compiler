@@ -130,3 +130,31 @@ fn broken_di_xml_of_a_disabled_module_does_not_stop_the_compile() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn invalid_extension_attributes_xml_stops_the_compile_and_names_the_file() {
+    let Some((_tmp, output)) = compile_with(&[(
+        "app/code/Acme/On/etc/extension_attributes.xml",
+        "<?xml version=\"1.0\"?>\n<config><extension_attributes for=\"Acme\\Thing\"></config>\n",
+    )]) else {
+        return;
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("etc/extension_attributes.xml"), "{stderr}");
+}
+
+#[test]
+fn invalid_extension_attributes_xml_of_a_disabled_module_compiles() {
+    let Some((_tmp, output)) = compile_with(&[(
+        "app/code/Acme/Off/etc/extension_attributes.xml",
+        "<config><extension_attributes for=\"Acme\\Thing\"></config>\n",
+    )]) else {
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
