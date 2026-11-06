@@ -148,10 +148,13 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Stops right after the closing label, so the caller still sees what ends the statement.
+    /// The label may be indented, and any character that cannot be part of a name ends it.
     fn skip_heredoc(&mut self) {
         self.skip_ws();
-        let nowdoc = self.peek() == b'\'';
-        if nowdoc {
+        let quote = self.peek();
+        let quoted = quote == b'\'' || quote == b'"';
+        if quoted {
             self.advance(1);
         }
         let label_start = self.pos;
@@ -159,7 +162,7 @@ impl<'a> Scanner<'a> {
             self.advance(1);
         }
         let label = self.src[label_start..self.pos].to_vec();
-        if nowdoc && self.peek() == b'\'' {
+        if quoted && self.peek() == quote {
             self.advance(1);
         }
         while !self.is_eof() && self.peek() != b'\n' {
@@ -169,21 +172,16 @@ impl<'a> Scanner<'a> {
             if self.is_eof() {
                 return;
             }
-            if self.peek() == b'\n' {
+            // At the newline before the next line.
+            self.advance(1);
+            while self.peek() == b' ' || self.peek() == b'\t' {
                 self.advance(1);
             }
-            if self.src.len() >= self.pos + label.len() {
-                let candidate = &self.src[self.pos..self.pos + label.len()];
-                if candidate == label.as_slice() {
-                    let after = self.pos + label.len();
-                    let next = self.src.get(after).copied().unwrap_or(0);
-                    if next == b';' || next == b'\n' || next == b'\r' || next == 0 {
-                        self.advance(label.len());
-                        if self.peek() == b';' {
-                            self.advance(1);
-                        }
-                        return;
-                    }
+            if self.src[self.pos..].starts_with(&label) {
+                let next = self.at(label.len());
+                if !is_ident_char(next) {
+                    self.advance(label.len());
+                    return;
                 }
             }
             while !self.is_eof() && self.peek() != b'\n' {
@@ -1324,6 +1322,10 @@ impl<'a> Scanner<'a> {
                     self.advance(1);
                     self.skip_dq_string();
                 }
+                b'<' if self.at(1) == b'<' && self.at(2) == b'<' => {
+                    self.advance(3);
+                    self.skip_heredoc();
+                }
                 b'/' if self.at(1) == b'/' => {
                     // Line comment ends the meaningful part of the default value.
                     // Break here leaving pos at `//`; the outer loop's skip_noise handles it.
@@ -1378,6 +1380,10 @@ impl<'a> Scanner<'a> {
                 b'"' => {
                     self.advance(1);
                     self.skip_dq_string();
+                }
+                b'<' if self.at(1) == b'<' && self.at(2) == b'<' => {
+                    self.advance(3);
+                    self.skip_heredoc();
                 }
                 b'(' | b'[' => {
                     depth += 1;
@@ -1911,6 +1917,61 @@ class Bar {
         assert_eq!(m.params[1].type_hint.as_deref(), Some("Foo\\D|Foo\\E"));
         assert!(m.params[1].has_default);
         assert_eq!(m.return_type.as_deref(), Some("X\\Y|Foo\\Z|null"));
+    }
+
+    fn method_names(info: &ClassInfo) -> Vec<&str> {
+        info.public_methods
+            .iter()
+            .map(|method| method.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn test_nowdoc_constant_does_not_hide_the_constructor() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Bar {\n    private const SCRIPT = <<<'LUA'\nif (x) { return 1; }\n}\nLUA;\n    public function __construct(\\Foo\\Dep $dep) {}\n    public function run() {}\n}",
+        )
+        .unwrap();
+        assert_eq!(method_names(&info), ["run"]);
+        assert_eq!(info.constructor.unwrap().params.len(), 1);
+    }
+
+    #[test]
+    fn test_quoted_heredoc_with_indented_closing_label() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Bar {\n    public $text = <<<\"TXT\"\n        a { b ; }\n        TXT;\n    public function __construct(\\Foo\\Dep $dep) {}\n}",
+        )
+        .unwrap();
+        assert_eq!(info.constructor.unwrap().params.len(), 1);
+    }
+
+    #[test]
+    fn test_heredoc_in_a_method_body_does_not_hide_later_methods() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Bar {\n    public function first() {\n        call(<<<SQL\n            SELECT 1 }\n            SQL, 2);\n    }\n    public function second() {}\n}",
+        )
+        .unwrap();
+        assert_eq!(method_names(&info), ["first", "second"]);
+    }
+
+    #[test]
+    fn test_word_starting_with_the_label_does_not_close_a_heredoc() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Bar {\n    const A = <<<END\nENDING }\nEND;\n    public function __construct(\\Foo\\Dep $dep) {}\n}",
+        )
+        .unwrap();
+        assert_eq!(info.constructor.unwrap().params.len(), 1);
+    }
+
+    #[test]
+    fn test_heredoc_as_constructor_default_keeps_later_parameters() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Bar {\n    public function __construct(string $text = <<<TXT\n        a, b) c\n        TXT, ?\\Foo\\Dep $dep = null) {}\n}",
+        )
+        .unwrap();
+        let params = info.constructor.unwrap().params;
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[1].name, "dep");
     }
 
     #[test]
