@@ -25,6 +25,9 @@ use quick_xml::Reader;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+mod file_level_checks;
+use file_level_checks::run_file_level_checks;
+
 use code_generator::{
     compile_plugin_list, extension_path, factory_path, generate_app_action_list_php,
     generate_area_config_with_overrides, generate_extension, generate_extension_interface,
@@ -34,7 +37,8 @@ use code_generator::{
     ExtensionAttributeSpec, ExtensionSpec, AREAS,
 };
 use di_resolver::{
-    detect_factories_from_configs, detect_interceptors, detect_proxies_from_configs_with_existing,
+    detect_factories_from_configs, detect_interceptors, detect_named_factories,
+    detect_proxies_from_configs_with_existing, proxy_targets_from_constructors,
     resolve_all_arguments, resolve_all_arguments_for_named_types, FactorySpec,
 };
 use di_xml_reader::{
@@ -43,7 +47,7 @@ use di_xml_reader::{
     Plugin,
 };
 use php_extractor::{
-    extract_file, extract_string_constants,
+    extract_file, extract_file_with_class_check, extract_string_constants,
     types::{
         ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
         MethodSignature,
@@ -451,13 +455,22 @@ fn main() {
     // (cache_ref is unused since di.xml parse-skip was removed as a correctness fix)
     let _cache_ref = &cache;
 
-    let class_map: FxHashMap<String, ClassInfo> = php_files
+    let file_level_checks = Mutex::new(Vec::new());
+    let mut class_map: FxHashMap<String, ClassInfo> = php_files
         .par_iter()
         .filter_map(|path| {
-            let result = extract_file(path);
+            let (result, has_class_check) = extract_file_with_class_check(path);
             pb.inc(1);
             match result {
-                ExtractResult::Ok(info) => Some((info.fqcn.clone(), info)),
+                ExtractResult::Ok(info) => {
+                    if has_class_check {
+                        file_level_checks
+                            .lock()
+                            .unwrap()
+                            .push((info.fqcn.clone(), path.clone()));
+                    }
+                    Some((info.fqcn.clone(), info))
+                }
                 ExtractResult::NoClass => None,
                 ExtractResult::PhpFallbackFailed(e) => {
                     fallback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -487,6 +500,13 @@ fn main() {
             _ => None,
         })
         .collect();
+
+    let classes_asked_for_by_files = run_file_level_checks(
+        &mut class_map,
+        file_level_checks.into_inner().unwrap(),
+        &magento_root,
+        &args.fallback_php,
+    );
 
     let fallbacks = fallback_count.load(std::sync::atomic::Ordering::Relaxed);
     let failures = failure_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -654,7 +674,8 @@ fn main() {
     // -----------------------------------------------------------------------
     let phase_4_started = Instant::now();
     let composer_autoload = ComposerAutoloadIndex::from_magento_root(&magento_root);
-    let proxy_targets = collect_proxy_targets_from_di_configs(&scanner_di_configs);
+    let mut proxy_targets = collect_proxy_targets_from_di_configs(&scanner_di_configs);
+    proxy_targets.extend(proxy_targets_from_constructors(&class_map));
     let mut extra_existing_proxy_targets: FxHashSet<String> = FxHashSet::default();
     if let Some(index) = &composer_autoload {
         for target in proxy_targets {
@@ -676,8 +697,47 @@ fn main() {
         }
     }
 
+    // Files only ask for a proxy when PHP found its target class.
+    extra_existing_proxy_targets.extend(
+        classes_asked_for_by_files
+            .iter()
+            .filter_map(|name| name.strip_suffix("\\Proxy").map(str::to_string)),
+    );
+
     let mut factories =
         detect_factories_from_configs(&class_map, &full_di_config, &scanner_di_configs, &di_config);
+    // `Reader::getConfigForScope()` reflects the target of every virtual type, and
+    // a file-level check asks for a class by name. Either one generates the class.
+    let virtual_type_names: FxHashSet<&str> = scanner_di_configs
+        .iter()
+        .flat_map(|cfg| cfg.virtual_types.keys().map(String::as_str))
+        .collect();
+    let source_exists = |fqcn: &str| {
+        class_map.contains_key(fqcn)
+            || disabled_class_map.contains_key(fqcn)
+            || composer_autoload
+                .as_ref()
+                .is_some_and(|index| index.is_loadable(fqcn))
+    };
+    factories.extend(detect_named_factories(
+        scanner_di_configs
+            .iter()
+            .flat_map(|cfg| cfg.virtual_types.values())
+            .map(|vt| vt.type_name.as_str())
+            .filter(|name| !virtual_type_names.contains(name.trim_start_matches('\\'))),
+        &class_map,
+        source_exists,
+    ));
+    factories.extend(detect_named_factories(
+        classes_asked_for_by_files
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !virtual_type_names.contains(*name)),
+        &class_map,
+        |_| true,
+    ));
+    factories.sort_by(|a, b| a.factory_fqcn.cmp(&b.factory_fqcn));
+    factories.dedup_by(|a, b| a.factory_fqcn == b.factory_fqcn);
     // Drop factories for classes that Composer already knows about (they exist in
     // a non-scanned vendor package, e.g. ramsey/uuid). PHP skips these too.
     if let Some(index) = &composer_autoload {
@@ -688,6 +748,7 @@ fn main() {
         &class_map,
         &scanner_di_configs,
         &extra_existing_proxy_targets,
+        &classes_asked_for_by_files,
     );
 
     // Extension class factories are generated by Magento's PHP scanner path.
