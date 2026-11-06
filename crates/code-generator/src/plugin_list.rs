@@ -88,6 +88,9 @@ pub struct PluginListMetadata {
     pub plugin_data: IndexMap<String, Vec<PluginConfig>>,
     pub inherited: IndexMap<String, Option<Vec<PluginConfig>>>,
     pub processed: IndexMap<String, ProcessedMethod>,
+    /// Active plugin classes that may fail `class_exists()`: not scanned, or not a class. Only
+    /// PHP can tell, because Magento's check goes through the autoloader.
+    pub unconfirmed_plugin_classes: Vec<String>,
 }
 
 /// Build the in-memory plugin list structures for one config:
@@ -183,10 +186,22 @@ pub fn compile_scope_plugin_list(
         );
     }
 
+    // `plugin_method_types` runs only for plugins that are not disabled, as in Magento.
+    let unconfirmed_plugin_classes = plugin_methods_cache
+        .keys()
+        .filter(|plugin_type| {
+            class_map
+                .get(plugin_type.as_str())
+                .is_none_or(|info| matches!(info.kind, ClassKind::Interface | ClassKind::Trait))
+        })
+        .cloned()
+        .collect();
+
     PluginListMetadata {
         plugin_data,
         inherited,
         processed,
+        unconfirmed_plugin_classes,
     }
 }
 
@@ -535,11 +550,6 @@ fn plugin_method_types(
 ) -> IndexMap<String, u8> {
     if let Some(cached) = cache.get(plugin_type) {
         return cached.clone();
-    }
-
-    // `PluginListGenerator` stops here with "Plugin class doesn't exist". This must not be silent.
-    if !class_map.contains_key(plugin_type) {
-        log::warn!("Plugin class {plugin_type} not found. Its plugin will not run.");
     }
 
     let methods = collect_public_methods_with_inheritance(plugin_type, class_map);

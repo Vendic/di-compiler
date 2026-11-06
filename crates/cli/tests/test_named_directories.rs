@@ -31,9 +31,6 @@ fn write_fixture(root: &Path) {
     <type name="Acme\On\Service\Test">
         <plugin name="watch" type="Acme\On\Plugin\Watch"/>
     </type>
-    <type name="Acme\On\Model\Gadget">
-        <plugin name="gone" type="Acme\On\Plugin\Gone"/>
-    </type>
 </config>
 "#,
     );
@@ -128,19 +125,4 @@ fn test_directory_at_module_root_is_still_skipped() {
     };
     let global = metadata(tmp.path(), "global.php");
     assert!(!global.contains("FooTest"), "{global}");
-}
-
-#[test]
-fn plugin_class_nobody_can_find_gives_a_warning() {
-    if Command::new("php").arg("-v").output().is_err() {
-        return;
-    }
-    let tmp = tempfile::TempDir::new().unwrap();
-    write_fixture(tmp.path());
-    let output = compile(tmp.path());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Plugin class Acme\\On\\Plugin\\Gone not found"),
-        "{stderr}"
-    );
 }

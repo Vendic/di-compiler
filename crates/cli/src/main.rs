@@ -262,6 +262,24 @@ function reflect_kind(string $class): ?string {
     if ($ref->isTrait()) return 'trait';
     return 'class';
 }
+// true or false like class_exists() in PluginListGenerator, whose autoloader also generates a
+// class on demand. A message means class_exists() threw, which stops Magento as well.
+function plugin_class_exists(string $class) {
+    try {
+        if (class_exists($class)) return true;
+        foreach (['\\Proxy', '\\Interceptor', '\\ProxyDeferred', '\\Remote', '\\Logger', 'Factory', 'Mapper',
+                  'Persistor', 'Repository', 'Converter', 'SearchResults', 'ExtensionInterface', 'Extension'] as $suffix) {
+            if (!str_ends_with($class, $suffix)) continue;
+            $source = substr($class, 0, -strlen($suffix));
+            foreach ([$source, $source . 'Interface'] as $name) {
+                if ($name !== 'Interface' && (class_exists($name) || interface_exists($name))) return true;
+            }
+        }
+        return false;
+    } catch (\Throwable $e) {
+        return $e->getMessage();
+    }
+}
 function reflect_const(string $expr) {
     $expr = ltrim($expr, '\\');
     if ($expr === '' || !defined($expr)) return null;
@@ -295,6 +313,7 @@ while (($line = fgets($stdin)) !== false) {
             'kind'    => reflect_kind($class),
             'const'   => reflect_const($class),
             'ctor'    => reflect_ctor($class),
+            'plugin_class_exists' => plugin_class_exists($class),
             default   => null,
         };
         fwrite(STDOUT, json_encode($result) . "\n");
@@ -1687,6 +1706,7 @@ fn main() {
             plugin_scopes.len() as u64,
             "Generating plugin-list metadata",
         );
+        let unconfirmed_plugin_classes = Mutex::new(std::collections::BTreeSet::new());
         plugin_scopes.par_iter().for_each(|&scope| {
             if let Some(scope_di_config) = area_di_configs.get(scope) {
                 // A scope with no di.xml of its own has the global config here, but loads
@@ -1706,6 +1726,10 @@ fn main() {
                     &plugin_list_class_definitions,
                     scope_virtual_types,
                 );
+                unconfirmed_plugin_classes
+                    .lock()
+                    .unwrap()
+                    .extend(metadata.unconfirmed_plugin_classes.iter().cloned());
                 let content = serialize_plugin_list_php(&metadata);
                 let cache_id = plugin_list_cache_id(scope);
                 let path = metadata_root.join(format!("{}.php", cache_id));
@@ -1719,6 +1743,7 @@ fn main() {
             pb_plugins.inc(1);
         });
         pb_plugins.finish_with_message("done");
+        stop_on_missing_plugin_classes(&unconfirmed_plugin_classes.into_inner().unwrap());
         log_phase_elapsed("Phase 7 plugin-list loop", t_plugin_list);
 
         // App action list metadata.
@@ -3281,6 +3306,40 @@ fn stop_on_object_default<'a>(class: &str, mut defaults: impl Iterator<Item = &'
             "error: {class} has an object as parameter default and needs generated code, which PHP cannot express"
         );
         std::process::exit(1);
+    }
+}
+
+/// `PluginListGenerator::inheritPlugins()` throws for an active plugin whose class fails
+/// `class_exists()`. An interface or a trait fails it too.
+fn stop_on_missing_plugin_classes(classes: &std::collections::BTreeSet<String>) {
+    let failures: Vec<String> = classes
+        .iter()
+        .filter_map(|class| plugin_class_failure(class))
+        .collect();
+    if !failures.is_empty() {
+        for failure in failures {
+            eprintln!("error: {failure}");
+        }
+        std::process::exit(1);
+    }
+}
+
+fn plugin_class_failure(class: &str) -> Option<String> {
+    let answer = PHP_WORKER_POOL
+        .get()
+        .and_then(|pool| pool.request(&format!("plugin_class_exists:{class}")))
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim()).ok());
+    match answer {
+        Some(serde_json::Value::Bool(true)) => None,
+        Some(serde_json::Value::Bool(false)) => Some(format!("Plugin class {class} doesn't exist")),
+        Some(serde_json::Value::String(message)) => {
+            Some(format!("Plugin class {class} cannot load: {message}"))
+        }
+        // No PHP answer proves nothing, and a false stop blocks a working store.
+        _ => {
+            log::warn!("Could not check plugin class {class} in PHP");
+            None
+        }
     }
 }
 
