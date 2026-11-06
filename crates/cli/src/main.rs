@@ -25,7 +25,9 @@ use quick_xml::Reader;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+mod di_xml_checks;
 mod file_level_checks;
+use di_xml_checks::DiXmlCheck;
 use file_level_checks::run_file_level_checks;
 
 use code_generator::{
@@ -710,6 +712,7 @@ fn main() {
         &magento_root,
     );
     log::info!("Found {} di.xml files (all areas)", all_di_xml_files.len());
+    let di_xml_check = DiXmlCheck::start(all_di_xml_files.clone(), args.fallback_php.clone());
 
     // Only parse files not already in the global set
     let extra_di_files: Vec<_> = all_di_xml_files
@@ -1038,6 +1041,11 @@ fn main() {
         })
         .collect();
     log_phase_elapsed("Phase 5", phase_5_started);
+
+    if let Err(message) = di_xml_check.finish() {
+        eprintln!("error: {message}");
+        std::process::exit(1);
+    }
 
     if args.dry_run {
         log::info!("Dry run — skipping file writes");
