@@ -1400,6 +1400,8 @@ fn main() {
         "webapi_rest",
         "webapi_soap",
     ];
+    let plugin_list_ids =
+        plugin_list_cache_ids(&magento_root, &args.fallback_php, &plugin_scopes_for_fp);
     let fp_hit = fp_hit && {
         AREAS
             .iter()
@@ -1409,7 +1411,7 @@ fn main() {
             .chain(
                 plugin_scopes_for_fp
                     .iter()
-                    .map(|s| metadata_root.join(format!("{}.php", plugin_list_cache_id(s)))),
+                    .map(|s| metadata_root.join(format!("{}.php", plugin_list_ids[*s]))),
             )
             .all(|p| p.exists())
     };
@@ -1816,8 +1818,7 @@ fn main() {
                     ),
                 );
                 let content = serialize_plugin_list_php(&metadata);
-                let cache_id = plugin_list_cache_id(scope);
-                let path = metadata_root.join(format!("{}.php", cache_id));
+                let path = metadata_root.join(format!("{}.php", plugin_list_ids[scope]));
                 must_write(&path, &content);
                 log::debug!(
                     "Phase 7 plugin-list scope={}: {:?}",
@@ -5512,6 +5513,125 @@ fn plugin_list_cache_id(scope: &str) -> String {
     } else {
         format!("primary|global|{}|plugin-list", scope)
     }
+}
+
+/// Runs the store's own `PluginListGenerator::write()` with empty collaborators, in a temporary
+/// folder, and prints the file name it gives each scope. A composer patch can change that name, so
+/// the framework version says nothing about it. Prints `null` when the store has no such class.
+///
+/// Newer versions type their properties, and the collaborators are too many to imitate, so the
+/// class source is loaded without those types. Only framework classes are needed, so the store's
+/// Composer autoloader and its side effects stay out of this.
+const PLUGIN_LIST_NAMES_PHP: &str = r#"
+ob_start();
+$scopes = array_slice($argv, 2);
+$dir = sys_get_temp_dir() . '/fast-di-plugin-list-' . getmypid();
+$frameworks = [$argv[1] . '/vendor/magento/framework/', $argv[1] . '/lib/internal/Magento/Framework/'];
+$locate = function ($relative) use ($frameworks) {
+    foreach ($frameworks as $framework) {
+        if (is_file($framework . $relative)) {
+            return $framework . $relative;
+        }
+    }
+    return null;
+};
+spl_autoload_register(function ($class) use ($locate) {
+    if (strpos($class, 'Magento\\Framework\\') === 0) {
+        $file = $locate(str_replace('\\', '/', substr($class, 18)) . '.php');
+        if ($file !== null) {
+            require $file;
+        }
+    }
+});
+$names = null;
+try {
+    $source = $locate('Interception/PluginListGenerator.php');
+    if ($source !== null) {
+        $names = [];
+        mkdir($dir);
+        eval(preg_replace(
+            ['/^\s*<\?php/', '/^(\s*)(private|protected|public)(?:\s+readonly)?\s+(?!function\b|const\b|static\b)[^\s$]+\s+(\$\w+)/m'],
+            ['', '$1$2 $3'],
+            file_get_contents($source)
+        ));
+        $empty = new class($dir) {
+            private $dir;
+            public function __construct($dir) { $this->dir = $dir; }
+            public function __call($method, $arguments) { return $method === 'getPath' ? $this->dir : []; }
+        };
+        $reflection = new ReflectionClass('Magento\\Framework\\Interception\\PluginListGenerator');
+        $generator = $reflection->newInstanceWithoutConstructor();
+        foreach ($reflection->getProperties() as $property) {
+            $property->setAccessible(true);
+            $name = $property->getName();
+            if ($name === 'scopePriorityScheme') {
+                $property->setValue($generator, ['primary', 'global']);
+            } elseif (!$property->isStatic() && $property->getValue($generator) === null) {
+                $property->setValue($generator, in_array($name, ['pluginData', 'processed'], true) ? [] : $empty);
+            }
+        }
+        foreach ($scopes as $scope) {
+            $generator->write([$scope]);
+            $files = array_values(array_diff(scandir($dir), ['.', '..']));
+            if (count($files) === 1) {
+                $names[$scope] = basename($files[0], '.php');
+            }
+            foreach ($files as $file) {
+                unlink($dir . '/' . $file);
+            }
+        }
+    }
+} catch (\Throwable $e) {
+    $names = [];
+}
+if (is_dir($dir)) {
+    array_map('unlink', array_map(function ($file) use ($dir) { return $dir . '/' . $file; }, array_diff(scandir($dir), ['.', '..'])));
+    rmdir($dir);
+}
+ob_end_clean();
+echo json_encode($names === null ? null : (object) $names);
+"#;
+
+/// The metadata file name of each plugin scope, without `.php`. `PluginList` reads a compiled list
+/// only under the name the store's own generator uses, and otherwise rebuilds it from every di.xml.
+/// A scope without an answer gets the name of the unpatched generator.
+fn plugin_list_cache_ids(
+    magento_root: &Path,
+    php_bin: &str,
+    scopes: &[&str],
+) -> FxHashMap<String, String> {
+    let answer = Command::new(php_bin)
+        .args(["-d", "display_errors=0", "-r", PLUGIN_LIST_NAMES_PHP, "--"])
+        .arg(magento_root)
+        .args(scopes)
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| {
+            serde_json::from_slice::<Option<FxHashMap<String, String>>>(&output.stdout).ok()
+        });
+    let names = match answer {
+        Some(names) => names,
+        None => {
+            log::warn!("Could not ask PluginListGenerator for its file names; using the defaults");
+            Some(FxHashMap::default())
+        }
+    };
+    scopes
+        .iter()
+        .map(|scope| {
+            let name = names.as_ref().and_then(|names| names.get(*scope)).cloned();
+            if name.is_none() && names.is_some() {
+                log::warn!(
+                    "PluginListGenerator gave no file name for scope {scope}; using the default"
+                );
+            }
+            (
+                scope.to_string(),
+                name.unwrap_or_else(|| plugin_list_cache_id(scope)),
+            )
+        })
+        .collect()
 }
 
 fn find_extension_attributes_files(
