@@ -37,30 +37,13 @@ fn merge_into_impl(dst: &mut DiConfig, src: DiConfig) {
         }
     }
 
-    // Plugins: merge by owner type, then by plugin name (last wins per name)
+    // Plugins: same scope, so merged attribute by attribute.
     for (owner, src_plugins) in src.plugins {
         let dst_plugins = dst.plugins.entry(owner).or_default();
         for src_plugin in src_plugins {
-            if let Some(existing) = dst_plugins.iter_mut().find(|p| p.name == src_plugin.name) {
-                if src_plugin.type_name.is_empty() {
-                    // Disabled-only override (no type attribute): preserve original type_name.
-                    existing.disabled = src_plugin.disabled;
-                    if src_plugin.sort_order != 0 {
-                        existing.sort_order = src_plugin.sort_order;
-                    }
-                } else {
-                    let was_disabled = existing.disabled;
-                    *existing = src_plugin;
-                    // PHP "sticky disabled": once disabled by an explicit override, the plugin
-                    // stays disabled even if a later module re-declares it as active.
-                    if was_disabled {
-                        existing.disabled = true;
-                    }
-                }
-            } else if !src_plugin.type_name.is_empty() {
-                // Only add a new plugin if it has a type; disabled-only entries with no prior
-                // declaration are no-ops.
-                dst_plugins.push(src_plugin);
+            match dst_plugins.iter_mut().find(|p| p.name == src_plugin.name) {
+                Some(existing) => existing.merge_same_scope(src_plugin),
+                None => dst_plugins.push(src_plugin),
             }
         }
     }
@@ -100,25 +83,13 @@ pub fn apply_module_config_on_primary(mut primary: DiConfig, module: DiConfig) -
         }
     }
 
-    // Plugins: same logic as merge_into
+    // Plugins: a later scope over an earlier one.
     for (owner, src_plugins) in module.plugins {
         let dst_plugins = primary.plugins.entry(owner).or_default();
         for src_plugin in src_plugins {
-            if let Some(existing) = dst_plugins.iter_mut().find(|p| p.name == src_plugin.name) {
-                if src_plugin.type_name.is_empty() {
-                    existing.disabled = src_plugin.disabled;
-                    if src_plugin.sort_order != 0 {
-                        existing.sort_order = src_plugin.sort_order;
-                    }
-                } else {
-                    let was_disabled = existing.disabled;
-                    *existing = src_plugin;
-                    if was_disabled {
-                        existing.disabled = true;
-                    }
-                }
-            } else if !src_plugin.type_name.is_empty() {
-                dst_plugins.push(src_plugin);
+            match dst_plugins.iter_mut().find(|p| p.name == src_plugin.name) {
+                Some(existing) => existing.merge_later_scope(src_plugin),
+                None => dst_plugins.push(src_plugin),
             }
         }
     }
@@ -234,14 +205,16 @@ mod tests {
                 Plugin {
                     name: "p1".into(),
                     type_name: "T1".into(),
-                    sort_order: 10,
-                    disabled: false,
+                    sort_order: Some(10),
+                    disabled: Some(false),
+                    disabled_after_type: false,
                 },
                 Plugin {
                     name: "p2".into(),
                     type_name: "T2".into(),
-                    sort_order: 20,
-                    disabled: false,
+                    sort_order: Some(20),
+                    disabled: Some(false),
+                    disabled_after_type: false,
                 },
             ],
         );
@@ -253,14 +226,16 @@ mod tests {
                 Plugin {
                     name: "p1".into(),
                     type_name: "T1Updated".into(),
-                    sort_order: 5,
-                    disabled: false,
+                    sort_order: Some(5),
+                    disabled: Some(false),
+                    disabled_after_type: false,
                 },
                 Plugin {
                     name: "p3".into(),
                     type_name: "T3".into(),
-                    sort_order: 30,
-                    disabled: false,
+                    sort_order: Some(30),
+                    disabled: Some(false),
+                    disabled_after_type: false,
                 },
             ],
         );
@@ -270,7 +245,7 @@ mod tests {
         assert_eq!(plugins.len(), 3);
         let p1 = plugins.iter().find(|p| p.name == "p1").unwrap();
         assert_eq!(p1.type_name, "T1Updated"); // overridden
-        assert_eq!(p1.sort_order, 5);
+        assert_eq!(p1.sort_order, Some(5));
     }
 
     #[test]
@@ -495,8 +470,9 @@ mod tests {
             vec![Plugin {
                 name: "p".into(),
                 type_name: "Foo\\Plugin".into(),
-                sort_order: 10,
-                disabled: false,
+                sort_order: Some(10),
+                disabled: Some(false),
+                disabled_after_type: false,
             }],
         );
 
@@ -507,20 +483,22 @@ mod tests {
             vec![Plugin {
                 name: "p".into(),
                 type_name: String::new(),
-                sort_order: 0,
-                disabled: true,
+                sort_order: Some(0),
+                disabled: Some(true),
+                disabled_after_type: false,
             }],
         );
 
-        // Later redeclaration should not re-enable the plugin.
+        // A later redeclaration with no disabled attribute keeps the earlier value.
         let mut c3 = DiConfig::default();
         c3.plugins.insert(
             "Foo\\Bar".into(),
             vec![Plugin {
                 name: "p".into(),
                 type_name: "Foo\\Plugin\\Override".into(),
-                sort_order: 20,
-                disabled: false,
+                sort_order: Some(20),
+                disabled: None,
+                disabled_after_type: false,
             }],
         );
 
@@ -531,7 +509,7 @@ mod tests {
             .and_then(|v| v.iter().find(|p| p.name == "p"))
             .expect("merged plugin");
         assert_eq!(plugin.type_name, "Foo\\Plugin\\Override");
-        assert!(plugin.disabled);
+        assert!(plugin.is_disabled());
     }
 
     // =========================================================================
@@ -578,8 +556,9 @@ mod tests {
         let make_plugin = |name: &str, type_name: &str| Plugin {
             name: name.to_string(),
             type_name: type_name.to_string(),
-            sort_order: 0,
-            disabled: false,
+            sort_order: Some(0),
+            disabled: Some(false),
+            disabled_after_type: false,
         };
 
         let mut c1 = DiConfig::default();
