@@ -176,6 +176,24 @@ fn broken_file_in_a_disabled_module_does_not_stop_the_compile() {
 }
 
 #[test]
+fn broken_file_in_a_disabled_module_stops_when_the_store_compiles_all_modules() {
+    let Some(output) = compile_with(&[
+        (
+            "setup/src/Magento/Setup/Console/Command/DiCompileCommand.php",
+            "<?php\n$modulePaths = $this->componentRegistrar->getPaths(ComponentRegistrar::MODULE);\n\
+             $list = ['application' => $modulePaths];\n",
+        ),
+        (
+            "app/code/Acme/Off/Model/Thing.php",
+            "<?php\nnamespace Acme\\Off\\Model;\n\nclass Thing extends Gone {}\n",
+        ),
+    ]) else {
+        return;
+    };
+    assert_stops(&output, &["Off/Model/Thing.php", "Acme\\Off\\Model\\Gone"]);
+}
+
+#[test]
 fn broken_file_under_test_does_not_stop_the_compile() {
     let Some(output) = compile_with(&[(
         "app/code/Acme/On/Test/Thing.php",
