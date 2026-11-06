@@ -1,17 +1,84 @@
 //! TKT-011: Merge multiple DiConfig instances in Magento load order.
 
-use crate::model::{Argument, DiConfig, TypeConfig};
+use indexmap::IndexSet;
+
+use crate::model::{Argument, DiConfig, Plugin, TypeConfig};
 
 /// Merge a list of partial DiConfig instances into one.
 ///
-/// Load order is assumed to be pre-sorted by caller (vendor/magento → vendor/* → app/etc → app/code).
-/// Later configs override earlier ones per Magento merge rules.
+/// The configs belong to one scope and are in load order. Later configs override earlier
+/// ones per Magento merge rules. Spellings of a type merge separately, as DOM nodes, and
+/// fold together at the end.
 pub fn merge_configs(configs: Vec<DiConfig>) -> DiConfig {
     let mut result = DiConfig::default();
     for config in configs {
         merge_into_impl(&mut result, config);
     }
+    result.fold_spellings();
     result
+}
+
+impl DiConfig {
+    /// Fold `\\X` into `X`, in the order the nodes were first seen.
+    ///
+    /// `Config\Reader\Filesystem` merges the files as a DOM, where `\\X` and `X` are separate
+    /// nodes. Then `ObjectManager\Config\Config::_mergeConfiguration()` and
+    /// `PluginListGenerator::merge()` walk the mapped nodes and trim the name. The later node
+    /// replaces plugin rows and whole arguments by name.
+    pub fn fold_spellings(&mut self) {
+        if !self.type_nodes.iter().any(|n| normalize(n) != *n) {
+            return;
+        }
+        let mut folded = IndexSet::with_capacity(self.type_nodes.len());
+        for spelled in std::mem::take(&mut self.type_nodes) {
+            let name = normalize(&spelled).to_string();
+            if spelled != name {
+                let plain_is_first = folded.contains(&name);
+                if let Some(plugins) = self.plugins.remove(&spelled) {
+                    let plugins = match self.plugins.remove(&name) {
+                        Some(plain) if plain_is_first => later_plugin_rows(plain, plugins),
+                        Some(plain) => later_plugin_rows(plugins, plain),
+                        None => plugins,
+                    };
+                    self.plugins.insert(name.clone(), plugins);
+                }
+                if let Some(config) = self.type_configs.remove(&spelled) {
+                    let config = match self.type_configs.remove(&name) {
+                        Some(plain) if plain_is_first => later_type_config(plain, config),
+                        Some(plain) => later_type_config(config, plain),
+                        None => config,
+                    };
+                    self.type_configs.insert(name.clone(), config);
+                }
+            }
+            folded.insert(name);
+        }
+        self.type_nodes = folded;
+        self.refresh_lookup_indexes();
+    }
+}
+
+fn normalize(name: &str) -> &str {
+    name.trim_start_matches('\\')
+}
+
+fn later_plugin_rows(mut first: Vec<Plugin>, later: Vec<Plugin>) -> Vec<Plugin> {
+    merge_later_plugins(&mut first, later);
+    first
+}
+
+fn later_type_config(mut first: TypeConfig, later: TypeConfig) -> TypeConfig {
+    apply_type_config_shallow(&mut first, later);
+    first
+}
+
+fn merge_later_plugins(dst: &mut Vec<Plugin>, later: Vec<Plugin>) {
+    for plugin in later {
+        match dst.iter_mut().find(|p| p.name == plugin.name) {
+            Some(existing) => existing.merge_later_scope(plugin),
+            None => dst.push(plugin),
+        }
+    }
 }
 
 pub fn merge_into(dst: &mut DiConfig, src: DiConfig) {
@@ -19,6 +86,8 @@ pub fn merge_into(dst: &mut DiConfig, src: DiConfig) {
 }
 
 fn merge_into_impl(dst: &mut DiConfig, src: DiConfig) {
+    dst.type_nodes.extend(src.type_nodes);
+
     // Preferences: last wins; incremental index update avoids full O(n) rebuild.
     for (k, v) in src.preferences {
         dst.insert_preference(k, v);
@@ -67,6 +136,8 @@ fn merge_into_impl(dst: &mut DiConfig, src: DiConfig) {
 ///   Phase 1: deep-merge all module di.xml files together (use `merge_configs`)
 ///   Phase 2: apply the merged module result onto `app/etc/di.xml` (use this fn)
 pub fn apply_module_config_on_primary(mut primary: DiConfig, module: DiConfig) -> DiConfig {
+    primary.type_nodes.extend(module.type_nodes);
+
     // Preferences: last wins; incremental index update avoids full O(n) rebuild.
     for (k, v) in module.preferences {
         primary.insert_preference(k, v);
@@ -85,13 +156,7 @@ pub fn apply_module_config_on_primary(mut primary: DiConfig, module: DiConfig) -
 
     // Plugins: a later scope over an earlier one.
     for (owner, src_plugins) in module.plugins {
-        let dst_plugins = primary.plugins.entry(owner).or_default();
-        for src_plugin in src_plugins {
-            match dst_plugins.iter_mut().find(|p| p.name == src_plugin.name) {
-                Some(existing) => existing.merge_later_scope(src_plugin),
-                None => dst_plugins.push(src_plugin),
-            }
-        }
+        merge_later_plugins(primary.plugins.entry(owner).or_default(), src_plugins);
     }
 
     // TypeConfigs: SHALLOW replacement — module arg replaces primary arg by name.
@@ -180,6 +245,87 @@ fn arg_name(arg: &Argument) -> &str {
 mod tests {
     use super::*;
     use crate::model::{Argument, DiConfig, Plugin, TypeConfig, VirtualType};
+    use crate::parser::parse_di_xml_bytes_unfolded;
+
+    fn unfolded(xml: &str) -> DiConfig {
+        parse_di_xml_bytes_unfolded(format!("<config>{xml}</config>").as_bytes()).unwrap()
+    }
+
+    fn plugin_names(config: &DiConfig, owner: &str) -> Vec<String> {
+        config.plugins[owner]
+            .iter()
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    fn array_items(config: &DiConfig, owner: &str) -> Vec<String> {
+        match &config.type_configs[owner].arguments[0] {
+            Argument::Array { items, .. } => {
+                items.iter().map(|a| arg_name(a).to_string()).collect()
+            }
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_type_spellings_merge_per_spelling_in_first_seen_order() {
+        let merged = merge_configs(vec![
+            unfolded(r#"<type name="Foo\Bar"><plugin name="a" type="A"/></type>"#),
+            unfolded(r#"<type name="\Foo\Bar"><plugin name="b" type="B"/></type>"#),
+            unfolded(r#"<type name="Foo\Bar"><plugin name="c" type="C"/></type>"#),
+        ]);
+        assert_eq!(plugin_names(&merged, "Foo\\Bar"), ["a", "c", "b"]);
+        assert!(!merged.plugins.contains_key("\\Foo\\Bar"));
+    }
+
+    #[test]
+    fn test_type_spelling_seen_first_on_a_node_without_plugins_comes_first() {
+        let merged = merge_configs(vec![
+            unfolded(r#"<type name="\Foo\Bar" shared="false"/>"#),
+            unfolded(r#"<type name="Foo\Bar"><plugin name="a" type="A"/></type>"#),
+            unfolded(r#"<type name="\Foo\Bar"><plugin name="b" type="B"/></type>"#),
+        ]);
+        assert_eq!(plugin_names(&merged, "Foo\\Bar"), ["b", "a"]);
+    }
+
+    #[test]
+    fn test_type_spellings_in_one_file_stay_separate() {
+        let merged = merge_configs(vec![
+            unfolded(
+                r#"<type name="\Foo\Bar"><plugin name="a" type="A"/></type>
+                   <type name="Foo\Bar"><plugin name="b" type="B"/></type>"#,
+            ),
+            unfolded(r#"<type name="\Foo\Bar"><plugin name="c" type="C"/></type>"#),
+        ]);
+        assert_eq!(plugin_names(&merged, "Foo\\Bar"), ["a", "c", "b"]);
+    }
+
+    #[test]
+    fn test_same_plugin_in_two_spellings_is_a_later_row_that_resets_sort_order() {
+        let merged = merge_configs(vec![
+            unfolded(r#"<type name="Foo\Bar"><plugin name="a" type="A" sortOrder="5"/></type>"#),
+            unfolded(r#"<type name="\Foo\Bar"><plugin name="a" disabled="true"/></type>"#),
+        ]);
+        let plugin = &merged.plugins["Foo\\Bar"][0];
+        assert_eq!(plugin.sort_order, Some(0));
+        assert_eq!(plugin.type_name, "A");
+        assert!(plugin.is_disabled());
+    }
+
+    #[test]
+    fn test_argument_in_another_spelling_replaces_the_whole_value() {
+        let array = |item: &str| {
+            format!(
+                r#"<arguments><argument name="list" xsi:type="array"><item name="{item}" xsi:type="string">v</item></argument></arguments>"#
+            )
+        };
+        let merged = merge_configs(vec![
+            unfolded(&format!(r#"<type name="Foo\Bar">{}</type>"#, array("a"))),
+            unfolded(&format!(r#"<type name="Foo\Bar">{}</type>"#, array("b"))),
+            unfolded(&format!(r#"<type name="\Foo\Bar">{}</type>"#, array("c"))),
+        ]);
+        assert_eq!(array_items(&merged, "Foo\\Bar"), ["c"]);
+    }
 
     #[test]
     fn test_preference_last_wins() {
