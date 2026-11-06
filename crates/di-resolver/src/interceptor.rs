@@ -3,7 +3,9 @@
 //! A class needs an interceptor when ANY of the following hold:
 //!   1. It has at least one active (non-disabled) plugin registered in di.xml, OR
 //!   2. It is a non-abstract, non-final concrete class that inherits (directly or
-//!      transitively) from a class that needs an interceptor.
+//!      transitively) from a class that needs an interceptor, OR
+//!   3. It is a concrete class whose own plugin entries have no class at all. Its
+//!      interceptor has no methods and its children inherit nothing from it.
 //!
 //! Phase 2 (inheritance propagation) ensures that when a parent class is intercepted,
 //! all concrete subclasses are also intercepted so the plugin system fires correctly

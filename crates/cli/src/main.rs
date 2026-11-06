@@ -6167,6 +6167,27 @@ mod tests {
     }
 
     #[test]
+    fn interception_keeps_a_plugin_an_area_disables_without_a_type() {
+        let parse = |xml: &str| {
+            di_xml_reader::parser::parse_di_xml_bytes(format!("<config>{xml}</config>").as_bytes())
+                .unwrap()
+        };
+        let global = [parse(
+            r#"<type name="Foo\Bar"><plugin name="x" type="Foo\Plugin" sortOrder="10"/></type>"#,
+        )];
+        let area = [parse(
+            r#"<type name="Foo\Bar"><plugin name="x" disabled="true"/></type>
+               <type name="Foo\Baz"><plugin name="y" sortOrder="5"/></type>"#,
+        )];
+
+        let merged = crate::merge_plugins_for_interception(&global, &area);
+
+        assert!(merged["Foo\\Bar"][0].is_active());
+        assert_eq!(merged["Foo\\Bar"][0].sort_order, Some(10));
+        assert!(merged["Foo\\Baz"].is_empty());
+    }
+
+    #[test]
     fn phase7_fingerprint_changes_when_public_plugin_method_changes() {
         let mut class_map = FxHashMap::default();
         let mut plugin_info = class_info("Vendor\\Module\\Plugin", None, false);
