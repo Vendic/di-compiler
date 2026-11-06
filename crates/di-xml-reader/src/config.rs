@@ -218,14 +218,16 @@ fn collect_di_xml_files(
         area: Option<&str>,
         out: &mut Vec<(u8, usize, std::path::PathBuf)>,
     ) {
-        let global = module_root.join("etc/di.xml");
-        if global.exists() {
-            out.push((priority, module_idx, global));
-        }
-        if let Some(a) = area {
-            let area_di = module_root.join(format!("etc/{}/di.xml", a));
-            if area_di.exists() {
-                out.push((priority, module_idx, area_di));
+        for root in registered_component_roots(module_root) {
+            let global = root.join("etc/di.xml");
+            if global.exists() {
+                out.push((priority, module_idx, global));
+            }
+            if let Some(a) = area {
+                let area_di = root.join(format!("etc/{}/di.xml", a));
+                if area_di.exists() {
+                    out.push((priority, module_idx, area_di));
+                }
             }
         }
     }
@@ -406,16 +408,7 @@ fn collect_di_xml_files(
                     let module_idx = cached_module_name(&module.path())
                         .and_then(|n| module_order.get(&n).copied())
                         .unwrap_or(usize::MAX);
-                    let global = module.path().join("etc/di.xml");
-                    if global.exists() {
-                        paths.push((1, module_idx, global));
-                    }
-                    if let Some(a) = area {
-                        let area_di = module.path().join(format!("etc/{}/di.xml", a));
-                        if area_di.exists() {
-                            paths.push((1, module_idx, area_di));
-                        }
-                    }
+                    push_module_di_paths(&module.path(), 1, module_idx, area, &mut paths);
                 }
             }
         }
@@ -424,6 +417,36 @@ fn collect_di_xml_files(
     // Sort by (priority, module_idx, path) for deterministic Magento-order merging
     paths.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     paths.into_iter().map(|(_, _, p)| p).collect()
+}
+
+/// The folders that the `registration.php` in `folder` registers. `ComponentRegistrar::register()`
+/// takes any path, for example `__DIR__ . '/src'`. Only that form is read here, a computed path
+/// counts as the folder itself. Without a `registration.php` the answer is the folder itself.
+pub fn registered_component_roots(folder: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(registration) = std::fs::read_to_string(folder.join("registration.php")) {
+        for (at, _) in registration.match_indices("__DIR__") {
+            let rest = registration[at + "__DIR__".len()..].trim_start();
+            let Some(rest) = rest.strip_prefix('.') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some(quote) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') else {
+                continue;
+            };
+            let Some((relative, _)) = rest[1..].split_once(quote) else {
+                continue;
+            };
+            let root = folder.join(relative.trim_start_matches('/'));
+            if root.is_dir() {
+                roots.push(root);
+            }
+        }
+    }
+    if roots.is_empty() {
+        roots.push(folder.to_path_buf());
+    }
+    roots
 }
 
 /// The folders of the `registration.php` files in `vendor/composer/autoload_files.php`.
@@ -452,7 +475,9 @@ fn normalize(s: &str) -> String {
 ///
 /// Returns `None` if the file doesn't exist or has no `name="..."` attribute.
 fn module_name_from_module_xml(module_root: &std::path::Path) -> Option<String> {
-    let content = std::fs::read_to_string(module_root.join("etc/module.xml")).ok()?;
+    let content = registered_component_roots(module_root)
+        .iter()
+        .find_map(|root| std::fs::read_to_string(root.join("etc/module.xml")).ok())?;
     let name_pos = content.find("name=\"")?;
     let rest = &content[name_pos + 6..];
     let end_pos = rest.find('"')?;

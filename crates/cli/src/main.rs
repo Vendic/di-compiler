@@ -48,7 +48,7 @@ use di_resolver::{
 use di_xml_reader::{
     apply_module_config_on_primary, composer_registered_module_roots, find_all_di_xml_files,
     find_di_xml_files, find_di_xml_files_for_area, merge_configs, merge_into,
-    parse_di_xml_unfolded, Argument, DiConfig, Plugin,
+    parse_di_xml_unfolded, registered_component_roots, Argument, DiConfig, Plugin,
 };
 use php_extractor::{
     extract_file, extract_file_with_class_check, extract_string_constants,
@@ -554,6 +554,10 @@ fn main() {
     let enabled_modules = load_module_order_from_config_php(&magento_root);
     let mut all_module_paths = read_module_paths(&magento_root);
     all_module_paths.extend(composer_registered_module_roots(&magento_root));
+    let mut all_module_paths: Vec<PathBuf> = all_module_paths
+        .iter()
+        .flat_map(|path| registered_component_roots(path))
+        .collect();
     all_module_paths.sort();
     all_module_paths.dedup();
     let (module_paths, disabled_module_paths) =

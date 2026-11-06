@@ -5,7 +5,7 @@ pub mod parser;
 
 pub use config::{
     composer_registered_module_roots, find_all_di_xml_files, find_di_xml_files,
-    find_di_xml_files_for_area,
+    find_di_xml_files_for_area, registered_component_roots,
 };
 pub use merger::{apply_module_config_on_primary, merge_configs, merge_into};
 pub use model::{Argument, DiConfig, Plugin, Preference, TypeConfig, VirtualType};
