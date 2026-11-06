@@ -518,6 +518,9 @@ fn main() {
         .unwrap_or_else(|| magento_root.join("generated"));
     let code_root = generated_root.join("code");
     let metadata_root = generated_root.join("metadata");
+    if !args.dry_run {
+        METADATA_ROOT.get_or_init(|| metadata_root.clone());
+    }
     if !args.dry_run && !generated_folders_are_writable(&generated_root) {
         eprintln!(
             "error: Command line user does not have read and write permissions on generated directory ({}). Please address this issue before using this command.",
@@ -961,8 +964,9 @@ fn main() {
         &interception_di_config,
         &magento_root.join("setup"),
     ) {
-        eprintln!("error: Class {class}\\Interceptor cannot extend final class {class}");
-        std::process::exit(1);
+        stop_compile(&format!(
+            "Class {class}\\Interceptor cannot extend final class {class}"
+        ));
     }
 
     let mut interceptors = detect_interceptors(&interception_class_map, &interception_di_config);
@@ -1077,8 +1081,7 @@ fn main() {
 
     if args.dry_run {
         if let Err(message) = di_xml_check.finish().and(class_checks.finish()) {
-            eprintln!("error: {message}");
-            std::process::exit(1);
+            stop_compile(&message);
         }
         log::info!("Dry run — skipping file writes");
         print_summary(
@@ -1315,8 +1318,7 @@ fn main() {
 
     // Generated code is on disk now, so a failure can be checked against the real classes.
     if let Err(message) = di_xml_check.finish().and(class_checks.finish()) {
-        eprintln!("error: {message}");
-        std::process::exit(1);
+        stop_compile(&message);
     }
 
     // -----------------------------------------------------------------------
@@ -1707,8 +1709,7 @@ fn main() {
         if let Err(message) =
             check_preference_targets(&area_di_configs, &class_map, &generated_class_map)
         {
-            eprintln!("error: {message}");
-            std::process::exit(1);
+            stop_compile(&message);
         }
 
         // Scope-specific plugin-list metadata files.
@@ -1802,8 +1803,7 @@ fn main() {
         if let Err(e) =
             std::fs::create_dir_all(&fp_dir).and_then(|()| std::fs::write(&fp_path, new_fp))
         {
-            eprintln!("error: Could not write {}: {e}", fp_path.display());
-            std::process::exit(1);
+            stop_compile(&format!("Could not write {}: {e}", fp_path.display()));
         }
     } // end 'phase7
     log_phase_elapsed("Phase 7", phase_7_started);
@@ -1955,8 +1955,7 @@ fn stop_on_missing_disabled_plugin_classes(classes: &BTreeSet<(String, String)>)
                 continue;
             }
         };
-        eprintln!("error: {message}");
-        std::process::exit(1);
+        stop_compile(&message);
     }
 }
 
@@ -2128,6 +2127,19 @@ fn is_generated_class_name(class: &str) -> bool {
         .any(|suffix| class.ends_with(suffix))
 }
 
+static METADATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Ends a compile that Magento would stop too. `DiCompileCommand::execute()` empties
+/// `generated/metadata` first, so a failed compile never leaves old metadata for the store to use.
+/// Removing it at the end gives the same result, and a passing compile can still skip phase 7.
+fn stop_compile(message: &str) -> ! {
+    eprintln!("error: {message}");
+    if let Some(root) = METADATA_ROOT.get() {
+        let _ = std::fs::remove_dir_all(root);
+    }
+    std::process::exit(1);
+}
+
 /// `Console\\GenerationDirectoryAccess::check()`: creates a missing folder and needs write access.
 /// A real write also notices what the mode bits do not show, such as an immutable folder.
 fn generated_folders_are_writable(generated_root: &Path) -> bool {
@@ -2151,8 +2163,7 @@ fn generated_folders_are_writable(generated_root: &Path) -> bool {
 /// because the store would run with a file missing or out of date.
 fn must_write(path: &Path, content: &str) -> bool {
     write_if_changed(path, content).unwrap_or_else(|e| {
-        eprintln!("error: Could not write {}: {e}", path.display());
-        std::process::exit(1);
+        stop_compile(&format!("Could not write {}: {e}", path.display()));
     })
 }
 
@@ -3190,11 +3201,8 @@ fn enrich_all_constructors_with_reflection(
     let mut unreadable = unreadable.into_inner().unwrap();
     if !unreadable.is_empty() && PHP_WORKER_POOL.get().is_some() {
         unreadable.sort();
-        eprintln!(
-            "error: PHP could not load these classes, so the values of their constructor defaults are unknown:\n  {}",
-            unreadable.join("\n  ")
-        );
-        std::process::exit(1);
+        stop_compile(&format!("PHP could not load these classes, so the values of their constructor defaults are unknown:\n  {}",
+            unreadable.join("\n  ")));
     }
 
     let (mut count0, mut count1, mut count2) = (0usize, 0usize, 0usize);
@@ -3245,10 +3253,7 @@ fn synthetic_reflected_class_info(fqcn: &str, params: Vec<ConstructorParam>) -> 
 /// compile stops. Written as is, it would be a PHP fatal error when the file loads.
 fn stop_on_object_default<'a>(class: &str, mut defaults: impl Iterator<Item = &'a str>) {
     if defaults.any(|default| default.starts_with("__obj__:")) {
-        eprintln!(
-            "error: {class} has an object as parameter default and needs generated code, which PHP cannot express"
-        );
-        std::process::exit(1);
+        stop_compile(&format!("{class} has an object as parameter default and needs generated code, which PHP cannot express"));
     }
 }
 
@@ -3260,10 +3265,7 @@ fn stop_on_missing_plugin_classes(classes: &std::collections::BTreeSet<String>) 
         .filter_map(|class| plugin_class_failure(class))
         .collect();
     if !failures.is_empty() {
-        for failure in failures {
-            eprintln!("error: {failure}");
-        }
-        std::process::exit(1);
+        stop_compile(&failures.join("\nerror: "));
     }
 }
 
