@@ -735,12 +735,6 @@ fn main() {
         &magento_root,
     );
     log::info!("Found {} di.xml files (all areas)", all_di_xml_files.len());
-    let di_xml_check = DiXmlCheck::start(
-        all_di_xml_files.clone(),
-        &magento_root,
-        &code_root,
-        args.fallback_php.clone(),
-    );
 
     // Only parse files not already in the global set
     let extra_di_files: Vec<_> = all_di_xml_files
@@ -793,6 +787,13 @@ fn main() {
     let phase_3c_started = Instant::now();
     let extension_attr_files =
         find_extension_attributes_files(&magento_root, &module_paths, &args.fallback_php);
+    let di_xml_check = DiXmlCheck::start(
+        all_di_xml_files.clone(),
+        extension_attr_files.clone(),
+        &magento_root,
+        &code_root,
+        args.fallback_php.clone(),
+    );
     let extension_attr_map = parse_extension_attributes_files(&extension_attr_files);
     let extension_specs = collect_extension_specs(&class_map, &extension_attr_map);
     log_phase_elapsed("Phase 3c", phase_3c_started);

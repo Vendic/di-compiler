@@ -16,7 +16,10 @@ const VALID_XML_PHP: &str = r#"
 ini_set('display_errors', '0');
 [, $root, $generated] = $argv;
 libxml_use_internal_errors(true);
-$files = file('php://stdin', FILE_IGNORE_NEW_LINES);
+$input = file('php://stdin', FILE_IGNORE_NEW_LINES);
+$split = array_search('', $input, true);
+$files = array_slice($input, 0, $split);
+$attributeFiles = array_slice($input, $split + 1);
 foreach ($files as $file) {
     libxml_clear_errors();
     try {
@@ -70,6 +73,23 @@ foreach ($files as $file) {
         $names[ltrim(trim($node->nodeValue), '\\')] = true;
     }
 }
+// `ServiceDataAttributesScanner::collectEntities()` reads these with plain `loadXML()`.
+foreach ($attributeFiles as $file) {
+    try {
+        $loaded = (new DOMDocument())->loadXML((string) file_get_contents($file));
+        $message = 'loadXML() failed';
+    } catch (\Throwable $e) {
+        $loaded = false;
+        $message = $e->getMessage();
+    }
+    if (!$loaded) {
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+        echo "invalid\nThe XML in file \"", $file, "\" is invalid: ", $message, "\n";
+        exit(0);
+    }
+}
 $invalid = [];
 foreach (array_keys($names) as $name) {
     $source = str_ends_with($name, '\\Proxy') ? substr($name, 0, -6) : $name;
@@ -97,6 +117,7 @@ pub(crate) struct DiXmlCheck(JoinHandle<Result<(), String>>);
 impl DiXmlCheck {
     pub(crate) fn start(
         files: Vec<PathBuf>,
+        attribute_files: Vec<PathBuf>,
         root: &Path,
         code_root: &Path,
         php_bin: String,
@@ -104,7 +125,7 @@ impl DiXmlCheck {
         let root = root.to_path_buf();
         let code_root = code_root.to_path_buf();
         Self(std::thread::spawn(move || {
-            check(&files, &root, &code_root, &php_bin)
+            check(&files, &attribute_files, &root, &code_root, &php_bin)
         }))
     }
 
@@ -116,7 +137,13 @@ impl DiXmlCheck {
     }
 }
 
-fn check(files: &[PathBuf], root: &Path, code_root: &Path, php_bin: &str) -> Result<(), String> {
+fn check(
+    files: &[PathBuf],
+    attribute_files: &[PathBuf],
+    root: &Path,
+    code_root: &Path,
+    php_bin: &str,
+) -> Result<(), String> {
     let could_not_run = |reason: String| format!("Could not check di.xml files in PHP: {reason}");
     let spawned = Command::new(php_bin)
         .args(["-d", "display_errors=0", "-r"])
@@ -140,6 +167,11 @@ fn check(files: &[PathBuf], root: &Path, code_root: &Path, php_bin: &str) -> Res
     };
     let mut input = String::new();
     for file in files {
+        input.push_str(&file.to_string_lossy());
+        input.push('\n');
+    }
+    input.push('\n');
+    for file in attribute_files {
         input.push_str(&file.to_string_lossy());
         input.push('\n');
     }
