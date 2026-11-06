@@ -391,7 +391,14 @@ fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
         return None;
     }
     let so = ctx.sort_order;
-    let arg = match ctx.xsi_type.as_str() {
+    // `Config\Dom` merges the files before it reads any type, so an argument can leave `xsi:type`
+    // to an earlier file. With items, that type can only be array.
+    let xsi_type = if ctx.xsi_type.is_empty() && !ctx.items.is_empty() {
+        "array"
+    } else {
+        ctx.xsi_type.as_str()
+    };
+    let arg = match xsi_type {
         "object" => Argument::Object {
             name,
             value: normalize(&ctx.text),
