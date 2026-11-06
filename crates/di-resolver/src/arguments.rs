@@ -571,6 +571,11 @@ fn first_non_null_class_type_hint_arm(type_hint: &str, namespace: &str) -> Optio
         "void", "never", "self", "parent", "static",
     ];
 
+    // Magento's GetParameterClassTrait finds no class for an intersection type.
+    if type_hint.contains('&') {
+        return None;
+    }
+
     type_hint
         .split('|')
         .map(str::trim)
@@ -1404,6 +1409,20 @@ mod tests {
             &args[0].resolved,
             ResolvedArgValue::SharedInstance(fqcn) if fqcn == "App\\Dep"
         ));
+    }
+
+    #[test]
+    fn test_intersection_type_has_no_class_like_magento() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class("App\\Service", vec![("dep", Some("App\\First&Second"))]),
+        );
+
+        let di_config = DiConfig::default();
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
+        let args = &map["App\\Service"];
+        assert!(matches!(&args[0].resolved, ResolvedArgValue::Null));
     }
 
     #[test]
