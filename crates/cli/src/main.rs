@@ -4902,9 +4902,11 @@ fn enrich_interceptor_specs_with_reflection(
                 })
                 .collect();
         } else {
+            // `current` holds the methods for plugins on parents. `expected` only knows
+            // the plugins on this class itself.
             let filtered: Vec<MethodSignature> = reflected_methods
                 .iter()
-                .filter(|m| expected.contains(&m.name))
+                .filter(|m| expected.contains(&m.name) || current.contains(&m.name))
                 .cloned()
                 .collect();
             if !filtered.is_empty() {
@@ -4964,8 +4966,8 @@ fn compute_expected_method_names(
         candidates.retain(|c| !c.is_empty());
 
         for candidate in &candidates {
-            if let Some(plugin_info) = class_map.get(candidate) {
-                for method in &plugin_info.public_methods {
+            if class_map.contains_key(candidate) {
+                for method in collect_public_methods_with_inheritance(candidate, class_map) {
                     if let Some(name) = plugin_method_to_intercepted(&method.name) {
                         names.insert(name);
                     }
