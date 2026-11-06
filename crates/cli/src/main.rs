@@ -284,6 +284,12 @@ function plugin_class_exists(string $class) {
         return $e->getMessage();
     }
 }
+// What `Reader::generateCachePerScope()` needs to know about the target of a preference.
+function preference_target(string $class) {
+    $exists = plugin_class_exists($class);
+    if ($exists !== true) return $exists === false ? 'missing' : $exists;
+    return class_exists($class, false) && (new ReflectionClass($class))->getExtension() !== null ? 'extension' : 'class';
+}
 function reflect_const(string $expr) {
     $expr = ltrim($expr, '\\');
     if ($expr === '' || !defined($expr)) return null;
@@ -318,6 +324,7 @@ while (($line = fgets($stdin)) !== false) {
             'const'   => reflect_const($class),
             'ctor'    => reflect_ctor($class),
             'plugin_class_exists' => plugin_class_exists($class),
+            'preference_target' => preference_target($class),
             default   => null,
         };
         fwrite(STDOUT, json_encode($result) . "\n");
@@ -1687,6 +1694,12 @@ fn main() {
             .collect();
         pb_area.finish_with_message("done");
         log_phase_elapsed("Phase 7 area-config loop", t_area_config);
+        if let Err(message) =
+            check_preference_targets(&area_di_configs, &class_map, &generated_class_map)
+        {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
 
         // Scope-specific plugin-list metadata files.
         let plugin_list_class_definitions: Vec<String> = Vec::new();
@@ -1858,31 +1871,121 @@ fn main() {
     let _ = std::fs::remove_file(&worker_script_path);
 }
 
+const GENERATED_CLASS_SUFFIXES: &[&str] = &[
+    "\\Proxy",
+    "\\Interceptor",
+    "\\ProxyDeferred",
+    "\\Remote",
+    "\\Logger",
+    "Factory",
+    "Mapper",
+    "Persistor",
+    "Repository",
+    "Converter",
+    "SearchResults",
+    "ExtensionInterface",
+    "Extension",
+];
+
 /// True for a class that exists, or that Magento's generator can make from a class that exists.
 fn generated_class_source_exists(class: &str, source_exists: &impl Fn(&str) -> bool) -> bool {
-    const SUFFIXES: &[&str] = &[
-        "\\Proxy",
-        "\\Interceptor",
-        "\\ProxyDeferred",
-        "\\Remote",
-        "\\Logger",
-        "Factory",
-        "Mapper",
-        "Persistor",
-        "Repository",
-        "Converter",
-        "SearchResults",
-        "ExtensionInterface",
-        "Extension",
-    ];
     source_exists(class)
-        || SUFFIXES.iter().any(|suffix| {
+        || GENERATED_CLASS_SUFFIXES.iter().any(|suffix| {
             class.strip_suffix(suffix).is_some_and(|source| {
                 !source.is_empty()
                     && (generated_class_source_exists(source, source_exists)
                         || source_exists(&format!("{source}Interface")))
             })
         })
+}
+
+/// `Compiler\\Config\\Reader::generateCachePerScope()`, for every preference of every area. Its
+/// list of known classes grows per area, because `fillThirdPartyInterfaces()` adds the classes
+/// that have a preference. So an area can pass thanks to an earlier one, and the order counts.
+fn check_preference_targets(
+    area_di_configs: &FxHashMap<String, std::sync::Arc<DiConfig>>,
+    class_map: &FxHashMap<String, ClassInfo>,
+    generated_class_map: &FxHashMap<String, ClassInfo>,
+) -> Result<(), String> {
+    let mut known_with_preference: FxHashSet<&str> = FxHashSet::default();
+    let mut answers: FxHashMap<String, Option<String>> = FxHashMap::default();
+    let areas = std::iter::once("global").chain(AREAS.iter().copied().filter(|a| *a != "global"));
+    for area in areas {
+        let Some(config) = area_di_configs.get(area) else {
+            continue;
+        };
+        known_with_preference.extend(config.preferences.keys().map(String::as_str));
+        let mut instances: Vec<&String> = config.preferences.keys().collect();
+        instances.sort();
+        for instance in instances {
+            let target = final_preference(instance, config)?;
+            if target == *instance || config.virtual_types.contains_key(&target) {
+                continue;
+            }
+            let scanned = class_map.get(&target);
+            let known = scanned.is_some()
+                || generated_class_map.contains_key(&target)
+                || known_with_preference.contains(target.as_str());
+            if scanned.is_some_and(|info| {
+                matches!(info.kind, ClassKind::Class | ClassKind::AbstractClass)
+            }) {
+                continue;
+            }
+            let answer = answers
+                .entry(target.clone())
+                .or_insert_with(|| {
+                    PHP_WORKER_POOL
+                        .get()
+                        .and_then(|pool| pool.request(&format!("preference_target:{target}")))
+                        .and_then(|raw| serde_json::from_str::<String>(raw.trim()).ok())
+                })
+                .as_deref();
+            match answer {
+                Some("extension") => {}
+                Some("class") if known || is_generated_class_name(&target) => {}
+                Some("class") => {
+                    return Err(format!(
+                        "Preference declared for \"{instance}\" as \"{target}\", but the latter has not been included in dependency injection compilation."
+                    ));
+                }
+                Some("missing") => {
+                    return Err(format!(
+                        "Preference declared for \"{instance}\" as \"{target}\", but the latter does not exist."
+                    ));
+                }
+                Some(message) => {
+                    return Err(format!(
+                        "Preference declared for \"{instance}\" as \"{target}\" cannot load: {message}"
+                    ));
+                }
+                // No PHP answer proves nothing, and a false stop blocks a working store.
+                None => log::warn!("Could not check preference target {target} in PHP"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ObjectManager\\Config\\Config::getPreference()`.
+fn final_preference(instance: &str, config: &DiConfig) -> Result<String, String> {
+    let mut current = instance.to_string();
+    let mut path: FxHashSet<String> = FxHashSet::default();
+    while let Some(next) = config.preferences.get(&current) {
+        let next = next.trim_start_matches('\\').to_string();
+        if !path.insert(next.clone()) {
+            return Err(format!(
+                "Circular type preference: {current} relates to {next} and viceversa."
+            ));
+        }
+        current = next;
+    }
+    Ok(current)
+}
+
+fn is_generated_class_name(class: &str) -> bool {
+    GENERATED_CLASS_SUFFIXES
+        .iter()
+        .any(|suffix| class.ends_with(suffix))
 }
 
 fn progress_bar(len: u64, msg: &str) -> ProgressBar {
