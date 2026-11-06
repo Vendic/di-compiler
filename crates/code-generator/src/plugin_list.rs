@@ -537,6 +537,11 @@ fn plugin_method_types(
         return cached.clone();
     }
 
+    // `PluginListGenerator` stops here with "Plugin class doesn't exist". This must not be silent.
+    if !class_map.contains_key(plugin_type) {
+        log::warn!("Plugin class {plugin_type} not found. Its plugin will not run.");
+    }
+
     let methods = collect_public_methods_with_inheritance(plugin_type, class_map);
     let mut result: IndexMap<String, u8> = IndexMap::new();
     for method in methods {

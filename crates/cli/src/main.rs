@@ -54,7 +54,7 @@ use php_extractor::{
         ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
         MethodSignature,
     },
-    walker::{read_module_paths, walk_php_files},
+    walker::{read_module_paths, walk_generated_php_files, walk_php_files},
 };
 
 #[derive(Parser, Debug)]
@@ -3281,7 +3281,7 @@ fn extract_generated_class_map(code_root: &Path) -> FxHashMap<String, ClassInfo>
     if !code_root.is_dir() {
         return FxHashMap::default();
     }
-    let files = walk_php_files(&[code_root.to_path_buf()]);
+    let files = walk_generated_php_files(code_root);
     let extracted: Vec<(String, ClassInfo)> = files
         .par_iter()
         .filter_map(|path| match extract_file(path) {

@@ -15,4 +15,4 @@ pub use traits::apply_traits;
 pub use types::{
     ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodSignature,
 };
-pub use walker::{read_module_paths, walk_php_files};
+pub use walker::{read_module_paths, walk_generated_php_files, walk_php_files};
