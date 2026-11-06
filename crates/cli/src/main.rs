@@ -646,7 +646,8 @@ fn main() {
             path: path.to_path_buf(),
         });
     };
-    let mut class_map: FxHashMap<String, ClassInfo> = php_files
+    let composer_autoload = ComposerAutoloadIndex::from_magento_root(&magento_root);
+    let extracted_classes: Vec<(String, ClassInfo)> = php_files
         .par_iter()
         .filter_map(|path| {
             let (result, facts) = extract_file_with_class_check(path);
@@ -693,6 +694,8 @@ fn main() {
             }
         })
         .collect();
+    let mut class_map =
+        class_map_preferring_autoloaded_files(extracted_classes, composer_autoload.as_ref());
     pb.finish_with_message("done");
     let class_checks = ClassChecks::start(
         scanned_files.into_inner().unwrap(),
@@ -725,7 +728,6 @@ fn main() {
         }
     }
 
-    let composer_autoload = ComposerAutoloadIndex::from_magento_root(&magento_root);
     apply_traits(&mut class_map, &|name| {
         disabled_class_map
             .get(name)
@@ -6163,6 +6165,37 @@ fn compiled_areas(di_config: &DiConfig) -> Vec<String> {
         }
     }
     areas
+}
+
+/// Two files in a module can declare one class, such as an old copy next to the real file.
+/// `ClassesScanner::includeClass()` asks the autoloader, so that file gives the constructor.
+/// Without an answer from Composer, the file named after the class wins, then the first path.
+fn class_map_preferring_autoloaded_files(
+    extracted: Vec<(String, ClassInfo)>,
+    composer: Option<&ComposerAutoloadIndex>,
+) -> FxHashMap<String, ClassInfo> {
+    let mut classes: FxHashMap<String, ClassInfo> = FxHashMap::default();
+    for (fqcn, info) in extracted {
+        let Some(earlier) = classes.get(&fqcn) else {
+            classes.insert(fqcn, info);
+            continue;
+        };
+        let autoloaded = composer
+            .and_then(|index| index.resolve_class_path(&fqcn))
+            .and_then(|path| path.canonicalize().ok());
+        let rank = |candidate: &ClassInfo| {
+            (
+                autoloaded.is_some() && candidate.path.canonicalize().ok() == autoloaded,
+                candidate.path.file_stem().and_then(|stem| stem.to_str())
+                    == Some(candidate.name.as_str()),
+                std::cmp::Reverse(candidate.path.clone()),
+            )
+        };
+        if rank(&info) > rank(earlier) {
+            classes.insert(fqcn, info);
+        }
+    }
+    classes
 }
 
 /// The parents, at any level, of the classes outside `folder`.
