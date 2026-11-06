@@ -58,25 +58,7 @@ pub fn detect_interceptors(
         // Skip Proxy-suffix NoninterceptableInterface implementors (generated proxy wrappers);
         // other source classes that implement NoninterceptableInterface (e.g. StructureLazy)
         // still get interceptors per PHP truth.
-        let is_concrete = match info {
-            None => false, // class not found on disk → skip
-            Some(info) => {
-                use php_extractor::types::ClassKind;
-                let short = owner_name
-                    .split('\\')
-                    .next_back()
-                    .unwrap_or(owner_name.as_str());
-                let is_proxy_noninterceptable = short.ends_with("Proxy")
-                    && info.implements.iter().any(|iface| {
-                        iface.trim_start_matches('\\')
-                            == "Magento\\Framework\\ObjectManager\\NoninterceptableInterface"
-                    });
-                !info.is_abstract
-                    && !matches!(info.kind, ClassKind::Interface | ClassKind::Trait)
-                    && !is_proxy_noninterceptable
-            }
-        };
-        if !is_concrete {
+        if !info.is_some_and(|info| is_concrete_owner(owner_name, info)) {
             continue;
         }
 
@@ -190,8 +172,47 @@ pub fn detect_interceptors(
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 3: Owners that only hold overrides with no class
+    //
+    // `PluginListGenerator::inheritPlugins()` gives such an owner an empty list instead
+    // of null, so `InterceptionConfigurationBuilder` generates an Interceptor with no
+    // methods. Its children inherit nothing from this.
+    // -----------------------------------------------------------------------
+    let with_spec: FxHashSet<String> = specs.iter().map(|spec| spec.fqcn.clone()).collect();
+    for (owner_name, plugins) in &di_config.plugins {
+        let only_overrides = !plugins.iter().any(|p| p.is_active())
+            && plugins.iter().any(|p| p.type_name.is_empty());
+        if !only_overrides || with_spec.contains(owner_name) {
+            continue;
+        }
+        let Some(info) = class_map.get(owner_name) else {
+            continue;
+        };
+        if !info.is_final && is_concrete_owner(owner_name, info) {
+            specs.push(InterceptorSpec {
+                fqcn: owner_name.clone(),
+                plugins: vec![],
+                public_methods: vec![],
+            });
+        }
+    }
+
     specs.sort_by(|a, b| a.fqcn.cmp(&b.fqcn));
     specs
+}
+
+fn is_concrete_owner(owner_name: &str, info: &ClassInfo) -> bool {
+    use php_extractor::types::ClassKind;
+    let short = owner_name.split('\\').next_back().unwrap_or(owner_name);
+    let is_proxy_noninterceptable = short.ends_with("Proxy")
+        && info.implements.iter().any(|iface| {
+            iface.trim_start_matches('\\')
+                == "Magento\\Framework\\ObjectManager\\NoninterceptableInterface"
+        });
+    !info.is_abstract
+        && !matches!(info.kind, ClassKind::Interface | ClassKind::Trait)
+        && !is_proxy_noninterceptable
 }
 
 fn select_interceptor_methods(
@@ -489,6 +510,25 @@ mod tests {
         );
         let specs = detect_interceptors(&class_map, &di_config);
         assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn test_owner_with_only_an_override_gets_an_empty_interceptor() {
+        let mut child = make_class("Foo\\Child", false);
+        child.extends = Some("Foo\\Bar".to_string());
+        let mut class_map = FxHashMap::default();
+        class_map.insert("Foo\\Bar".to_string(), make_class("Foo\\Bar", false));
+        class_map.insert("Foo\\Child".to_string(), child);
+        let mut di_config = DiConfig::default();
+        di_config
+            .plugins
+            .insert("Foo\\Bar".to_string(), vec![make_plugin("p", "", 0, true)]);
+
+        let specs = detect_interceptors(&class_map, &di_config);
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].fqcn, "Foo\\Bar");
+        assert!(specs[0].public_methods.is_empty());
     }
 
     #[test]

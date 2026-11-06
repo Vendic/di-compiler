@@ -3402,11 +3402,12 @@ fn build_interception_registry(
         .map(|spec| spec.fqcn.trim_start_matches('\\').to_string())
         .collect();
 
-    // Active plugin owners are intercepted even when no InterceptorSpec file is emitted
+    // Every plugin owner is intercepted, also when each entry is disabled or has no class
+    // (`Config::generateIntercepted()`), and when no InterceptorSpec file is emitted
     // (e.g. abstract classes/interfaces used only as plugin declaration owners).
     // Normalize the owner name to strip any leading backslash so it matches type_names.
     intercepted_targets.extend(di_config.plugins.iter().filter_map(|(owner, plugins)| {
-        if plugins.iter().any(|plugin| plugin.is_active()) {
+        if !plugins.is_empty() {
             Some(owner.trim_start_matches('\\').to_string())
         } else {
             None
