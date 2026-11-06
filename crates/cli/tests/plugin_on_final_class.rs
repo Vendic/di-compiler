@@ -173,3 +173,36 @@ fn final_class_that_is_not_interceptable_compiles() {
     };
     assert_compiles(&output);
 }
+
+#[test]
+fn plugin_on_a_readonly_class_stops_the_compile() {
+    let Some(output) = run(vec![
+        model(
+            "Locked",
+            "readonly class Locked\n{\n    public function run()\n    {\n    }\n}",
+        ),
+        plugin_on("Locked", ""),
+    ]) else {
+        return;
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cannot extend readonly class Acme\\On\\Model\\Locked"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn the_word_readonly_in_a_comment_compiles() {
+    let Some(output) = run(vec![
+        model(
+            "Open",
+            "// A readonly class would break here.\nclass Open\n{\n    public function run()\n    {\n    }\n}",
+        ),
+        plugin_on("Open", ""),
+    ]) else {
+        return;
+    };
+    assert_compiles(&output);
+}
