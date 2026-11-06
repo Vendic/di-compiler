@@ -48,6 +48,7 @@ use di_xml_reader::{
 };
 use php_extractor::{
     extract_file, extract_file_with_class_check, extract_string_constants,
+    is_plain_literal_default,
     types::{
         ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
         MethodSignature,
@@ -171,6 +172,34 @@ if ($root === '' || !file_exists($root . '/vendor/autoload.php')) {
     exit(1);
 }
 @require $root . '/vendor/autoload.php';
+// Magento's Autoload\Populator adds the generation directory. Composer remembers a class it
+// did not find, and this worker can outlive that moment, so this loader looks again each time.
+$generated = $argv[2] ?? '';
+spl_autoload_register(function (string $class) use ($generated): void {
+    $file = $generated . '/' . str_replace('\\', '/', $class) . '.php';
+    if (is_file($file)) require $file;
+});
+// Encodes a default value. `__php__:` and `__obj__:` carry a var_export() expression.
+function holds_object($v): bool {
+    if (is_array($v)) { foreach ($v as $i) if (holds_object($i)) return true; return false; }
+    return is_object($v);
+}
+function holds_instance($v): bool {
+    if (is_array($v)) { foreach ($v as $i) if (holds_instance($i)) return true; return false; }
+    return is_object($v) && !($v instanceof UnitEnum);
+}
+function encode_default($v): string {
+    if (holds_instance($v)) return '__obj__:' . var_export($v, true);
+    if (holds_object($v)) return '__php__:' . var_export($v, true);
+    if (is_array($v)) {
+        $json = json_encode($v);
+        return $json === false ? '__php__:' . var_export($v, true) : '__json__:' . $json;
+    }
+    if ((is_float($v) && !is_finite($v)) || $v === PHP_INT_MIN || (is_string($v) && str_contains($v, "\0"))) {
+        return '__php__:' . var_export($v, true);
+    }
+    return var_export($v, true);
+}
 function tstr($t): ?string {
     if ($t === null) return null;
     if ($t instanceof ReflectionNamedType) {
@@ -199,7 +228,7 @@ function reflect_methods(string $class): ?array {
         $params = [];
         foreach ($m->getParameters() as $p) {
             $dv = null; $hd = $p->isDefaultValueAvailable() && !$p->isVariadic();
-            if ($hd) { $raw = $p->getDefaultValue(); $dv = is_array($raw) ? '__json__:'.json_encode($raw) : var_export($raw, true); }
+            if ($hd) { $dv = encode_default($p->getDefaultValue()); }
             $params[] = ['name'=>$p->getName(),'type_hint'=>tstr($p->getType()),
                 'has_default'=>$hd,'default_value'=>$dv,
                 'is_variadic'=>$p->isVariadic(),'is_by_ref'=>$p->isPassedByReference()];
@@ -229,7 +258,7 @@ function reflect_ctor(string $class): ?array {
     $params = [];
     foreach ($ctor->getParameters() as $p) {
         $dv = null; $hd = $p->isDefaultValueAvailable() && !$p->isVariadic();
-        if ($hd) { $raw = $p->getDefaultValue(); $dv = is_array($raw) ? '__json__:'.json_encode($raw) : var_export($raw, true); }
+        if ($hd) { $dv = encode_default($p->getDefaultValue()); }
         $params[] = ['name'=>$p->getName(),'type_hint'=>tstr($p->getType()),
             'has_default'=>$hd,'default_value'=>$dv,'is_variadic'=>$p->isVariadic()];
     }
@@ -266,7 +295,12 @@ struct PhpWorker {
 }
 
 impl PhpWorker {
-    fn spawn(php_bin: &str, magento_root: &Path, script_path: &Path) -> Option<Self> {
+    fn spawn(
+        php_bin: &str,
+        magento_root: &Path,
+        code_root: &Path,
+        script_path: &Path,
+    ) -> Option<Self> {
         let mut child = Command::new(php_bin)
             .arg("-d")
             .arg("display_errors=0")
@@ -274,6 +308,7 @@ impl PhpWorker {
             .arg("display_startup_errors=0")
             .arg(script_path)
             .arg(magento_root)
+            .arg(code_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -315,25 +350,35 @@ struct PhpWorkerPool {
     workers: Mutex<Vec<PhpWorker>>,
     php_bin: String,
     magento_root: PathBuf,
+    code_root: PathBuf,
     script_path: PathBuf,
 }
 
 impl PhpWorkerPool {
-    fn new(php_bin: String, magento_root: PathBuf, script_path: PathBuf) -> Self {
+    fn new(
+        php_bin: String,
+        magento_root: PathBuf,
+        code_root: PathBuf,
+        script_path: PathBuf,
+    ) -> Self {
         PhpWorkerPool {
             workers: Mutex::new(Vec::new()),
             php_bin,
             magento_root,
+            code_root,
             script_path,
         }
     }
 
     fn checkout(&self) -> Option<PhpWorker> {
-        self.workers
-            .lock()
-            .unwrap()
-            .pop()
-            .or_else(|| PhpWorker::spawn(&self.php_bin, &self.magento_root, &self.script_path))
+        self.workers.lock().unwrap().pop().or_else(|| {
+            PhpWorker::spawn(
+                &self.php_bin,
+                &self.magento_root,
+                &self.code_root,
+                &self.script_path,
+            )
+        })
     }
 
     fn checkin(&self, w: PhpWorker) {
@@ -359,7 +404,7 @@ impl PhpWorkerPool {
 
 static PHP_WORKER_POOL: OnceLock<PhpWorkerPool> = OnceLock::new();
 
-fn init_php_worker_pool(php_bin: &str, magento_root: &Path) -> PathBuf {
+fn init_php_worker_pool(php_bin: &str, magento_root: &Path, code_root: &Path) -> PathBuf {
     let script_path =
         std::env::temp_dir().join(format!("fast-di-worker-{}.php", std::process::id()));
     std::fs::write(&script_path, WORKER_PHP)
@@ -368,6 +413,7 @@ fn init_php_worker_pool(php_bin: &str, magento_root: &Path) -> PathBuf {
         PhpWorkerPool::new(
             php_bin.to_string(),
             magento_root.to_path_buf(),
+            code_root.to_path_buf(),
             script_path.clone(),
         )
     });
@@ -420,7 +466,7 @@ fn main() {
     let metadata_root = generated_root.join("metadata");
 
     // Initialise the persistent PHP worker pool (one autoload per worker process).
-    let worker_script_path = init_php_worker_pool(&args.fallback_php, &magento_root);
+    let worker_script_path = init_php_worker_pool(&args.fallback_php, &magento_root, &code_root);
 
     log::info!(
         "fast-di-compile starting\n  magento_root: {}\n  output:       {}",
@@ -723,6 +769,14 @@ fn main() {
         &class_map,
         source_exists,
     ));
+    // Loading a class loads its parent, and that generates a parent which is a factory.
+    factories.extend(detect_named_factories(
+        class_map
+            .values()
+            .filter_map(|info| info.extends.as_deref()),
+        &class_map,
+        source_exists,
+    ));
     factories.extend(detect_named_factories(
         classes_asked_for_by_files
             .iter()
@@ -973,6 +1027,10 @@ fn main() {
             }
             let params =
                 reflect_constructor_params(&spec.fqcn, &args.magento_root, &args.fallback_php)?;
+            stop_on_object_default(
+                &spec.fqcn,
+                params.iter().filter_map(|p| p.default_value.as_deref()),
+            );
             Some((spec.fqcn.clone(), params))
         })
         .collect();
@@ -1043,6 +1101,13 @@ fn main() {
             let mut reflected_methods =
                 reflect_interceptable_methods(target_fqcn, &args.magento_root, &args.fallback_php)?;
             for method in reflected_methods.iter_mut() {
+                stop_on_object_default(
+                    target_fqcn,
+                    method
+                        .params
+                        .iter()
+                        .filter_map(|p| p.default_value.as_deref()),
+                );
                 normalize_reflected_method_signature_for_proxy(
                     method,
                     target_fqcn,
@@ -3052,12 +3117,12 @@ fn enrich_all_constructors_with_reflection(
     // kind: 0 = update ctor (allow empty), 1 = update ctor (skip empty), 2 = insert if missing
     let mut candidates: Vec<(String, u8)> = Vec::new();
 
-    // Pass 1: classes whose existing ctor has constant-reference defaults.
+    // Pass 1: classes whose existing ctor has a default that is not a plain literal.
     for (fqcn, info) in class_map.iter() {
         let needs = info
             .constructor
             .as_ref()
-            .map(|ctor| constructor_defaults_need_constant_reflection(&ctor.params))
+            .map(|ctor| constructor_defaults_need_reflection(&ctor.params))
             .unwrap_or(false);
         if needs {
             candidates.push((fqcn.clone(), 0));
@@ -3098,17 +3163,35 @@ fn enrich_all_constructors_with_reflection(
         return (0, 0, 0);
     }
 
+    let unreadable: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // Single par_iter over all candidates — one Rayon barrier instead of three.
     let reflected: Vec<(String, Vec<ConstructorParam>, u8)> = candidates
         .par_iter()
         .filter_map(|(fqcn, kind)| {
-            let params = reflect_constructor_params(fqcn, magento_root, php_bin)?;
+            let Some(params) = reflect_constructor_params(fqcn, magento_root, php_bin) else {
+                if *kind == 0 {
+                    unreadable.lock().unwrap().push(fqcn.clone());
+                }
+                return None;
+            };
             if *kind == 1 && params.is_empty() {
                 return None; // inherited no-arg ctor is not useful
             }
             Some((fqcn.clone(), params, *kind))
         })
         .collect();
+
+    // Source text is not a value: it would reach the constructor as a wrong string. Magento
+    // stops as well when a scanned class does not load.
+    let mut unreadable = unreadable.into_inner().unwrap();
+    if !unreadable.is_empty() && PHP_WORKER_POOL.get().is_some() {
+        unreadable.sort();
+        eprintln!(
+            "error: PHP could not load these classes, so the values of their constructor defaults are unknown:\n  {}",
+            unreadable.join("\n  ")
+        );
+        std::process::exit(1);
+    }
 
     let (mut count0, mut count1, mut count2) = (0usize, 0usize, 0usize);
     for (fqcn, params, kind) in reflected {
@@ -3153,12 +3236,22 @@ fn synthetic_reflected_class_info(fqcn: &str, params: Vec<ConstructorParam>) -> 
     }
 }
 
-fn constructor_defaults_need_constant_reflection(params: &[ConstructorParam]) -> bool {
+/// Magento's `EntityAbstract` cannot write an object as a default in generated code, and its
+/// compile stops. Written as is, it would be a PHP fatal error when the file loads.
+fn stop_on_object_default<'a>(class: &str, mut defaults: impl Iterator<Item = &'a str>) {
+    if defaults.any(|default| default.starts_with("__obj__:")) {
+        eprintln!(
+            "error: {class} has an object as parameter default and needs generated code, which PHP cannot express"
+        );
+        std::process::exit(1);
+    }
+}
+
+fn constructor_defaults_need_reflection(params: &[ConstructorParam]) -> bool {
     params.iter().any(|p| {
         p.default_value
             .as_deref()
-            .map(|dv| dv.contains("::"))
-            .unwrap_or(false)
+            .is_some_and(|dv| !is_plain_literal_default(dv))
     })
 }
 
@@ -4709,6 +4802,10 @@ fn enrich_interceptor_specs_with_reflection(
         .filter_map(|fqcn| {
             let mut methods = reflect_interceptable_methods(fqcn, magento_root, php_bin)?;
             for m in &mut methods {
+                stop_on_object_default(
+                    fqcn,
+                    m.params.iter().filter_map(|p| p.default_value.as_deref()),
+                );
                 normalize_reflected_method_signature(m, fqcn, class_map);
             }
             Some((fqcn.clone(), methods))
@@ -4867,10 +4964,7 @@ fn interceptor_methods_need_reflection_normalization(methods: &[MethodSignature]
                         .default_value
                         .as_deref()
                         .map(|dv| {
-                            let t = dv.trim();
-                            t.contains("::")
-                                || t.eq_ignore_ascii_case("null")
-                                || t.starts_with("array (")
+                            dv.trim().eq_ignore_ascii_case("null") || !is_plain_literal_default(dv)
                         })
                         .unwrap_or(false)
             })
@@ -5278,10 +5372,7 @@ fn constructor_params_need_reflection(params: &[ConstructorParam]) -> bool {
             || param
                 .default_value
                 .as_deref()
-                .map(|dv| {
-                    let t = dv.trim();
-                    t.contains("::") || t.eq_ignore_ascii_case("null") || t.starts_with("array (")
-                })
+                .map(|dv| dv.trim().eq_ignore_ascii_case("null") || !is_plain_literal_default(dv))
                 .unwrap_or(false)
     })
 }

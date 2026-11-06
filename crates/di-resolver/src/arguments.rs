@@ -627,6 +627,13 @@ fn resolve_non_object_default(
             return ResolvedArgValue::PlainArray(json_to_plain_array_items(&v));
         }
     }
+    // Values only PHP can write, such as enum cases and objects.
+    if let Some(expr) = trimmed
+        .strip_prefix("__php__:")
+        .or_else(|| trimmed.strip_prefix("__obj__:"))
+    {
+        return ResolvedArgValue::Scalar(ResolvedScalar::PhpExpression(expr.to_string()));
+    }
     if let Some(items) = parse_php_array_default(trimmed) {
         return ResolvedArgValue::PlainArray(items);
     }
@@ -956,7 +963,8 @@ fn value_to_php_array_key(value: &ResolvedArrayValue) -> Option<String> {
         ResolvedArrayValue::Scalar(ResolvedScalar::Bool(true)) => Some("1".to_string()),
         ResolvedArrayValue::Scalar(ResolvedScalar::Bool(false)) => Some("0".to_string()),
         ResolvedArrayValue::Null => Some(String::new()),
-        ResolvedArrayValue::Array(_) => None,
+        ResolvedArrayValue::Scalar(ResolvedScalar::PhpExpression(_))
+        | ResolvedArrayValue::Array(_) => None,
     }
 }
 

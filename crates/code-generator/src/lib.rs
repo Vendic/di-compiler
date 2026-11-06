@@ -44,6 +44,9 @@ pub fn render_php_default(default_value: &str) -> std::borrow::Cow<'_, str> {
             return std::borrow::Cow::Owned(json_value_to_php_literal(&v));
         }
     }
+    if let Some(expr) = default_value.strip_prefix("__php__:") {
+        return std::borrow::Cow::Borrowed(expr);
+    }
     std::borrow::Cow::Borrowed(default_value)
 }
 
