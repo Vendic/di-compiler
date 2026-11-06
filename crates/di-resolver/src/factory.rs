@@ -43,9 +43,16 @@ pub fn detect_factories_from_configs(
         .collect();
 
     let mut emit = |candidate: String, from_xml: bool| {
-        let Some(factory_fqcn) = first_non_null_type_hint_arm(&candidate) else {
+        let Some(mut factory_fqcn) = first_non_null_type_hint_arm(&candidate) else {
             return;
         };
+        // `Generator::generateClass()` loads the source of `XFactory\Proxy`, and the autoloader
+        // generates that factory on the spot.
+        if let Some(source) = factory_fqcn.strip_suffix("\\Proxy") {
+            if source.ends_with("Factory") {
+                factory_fqcn = source.to_string();
+            }
+        }
         if !factory_fqcn.ends_with("Factory") {
             return;
         }
