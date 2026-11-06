@@ -518,6 +518,13 @@ fn main() {
         .unwrap_or_else(|| magento_root.join("generated"));
     let code_root = generated_root.join("code");
     let metadata_root = generated_root.join("metadata");
+    if !args.dry_run && !generated_folders_are_writable(&generated_root) {
+        eprintln!(
+            "error: Command line user does not have read and write permissions on generated directory ({}). Please address this issue before using this command.",
+            generated_root.display()
+        );
+        std::process::exit(1);
+    }
 
     // Initialise the persistent PHP worker pool (one autoload per worker process).
     let worker_script_path = init_php_worker_pool(&args.fallback_php, &magento_root, &code_root);
@@ -1140,10 +1147,8 @@ fn main() {
         let content = generate_interceptor(spec, effective_info.as_ref());
         let rel = interceptor_path(&spec.fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -1153,10 +1158,8 @@ fn main() {
         let content = generate_factory(spec);
         let rel = factory_path(&spec.factory_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -1249,10 +1252,8 @@ fn main() {
         let content = generate_proxy(spec, target_info.as_ref());
         let rel = proxy_path(&spec.proxy_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -1262,10 +1263,8 @@ fn main() {
         let content = generate_search_results(&spec.result_fqcn, &spec.source_fqcn);
         let rel = search_results_path(&spec.result_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -1278,10 +1277,8 @@ fn main() {
             generate_proxy_deferred(&spec.proxy_fqcn, &spec.target_fqcn, target_info.as_ref());
         let rel = proxy_deferred_path(&spec.proxy_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -1294,10 +1291,8 @@ fn main() {
         let content = generate_extension_interface(spec);
         let rel = extension_path(&spec.extension_interface_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -1310,10 +1305,8 @@ fn main() {
         let content = generate_extension(spec);
         let rel = extension_path(&spec.extension_class_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -1496,7 +1489,7 @@ fn main() {
         // interception.php
         let interception_content = serialize_interception_php(&all_fqcns);
         let interception_path = metadata_root.join("interception.php");
-        let _ = write_if_changed(&interception_path, &interception_content);
+        must_write(&interception_path, &interception_content);
         log::debug!(
             "Phase 7 interception registry+php: {:?}",
             t_interception.elapsed()
@@ -1704,7 +1697,7 @@ fn main() {
                     t_area_args.elapsed()
                 );
                 let area_path = metadata_root.join(format!("{}.php", area));
-                let _ = write_if_changed(&area_path, &area_content);
+                must_write(&area_path, &area_content);
                 pb_area.inc(1);
                 (area.to_string(), area_di_config)
             })
@@ -1788,7 +1781,7 @@ fn main() {
                 let content = serialize_plugin_list_php(&metadata);
                 let cache_id = plugin_list_cache_id(scope);
                 let path = metadata_root.join(format!("{}.php", cache_id));
-                let _ = write_if_changed(&path, &content);
+                must_write(&path, &content);
                 log::debug!(
                     "Phase 7 plugin-list scope={}: {:?}",
                     scope,
@@ -1805,9 +1798,13 @@ fn main() {
         // App action list metadata.
         let app_action_list = generate_app_action_list_php(&class_map);
         let app_action_list_path = metadata_root.join("app_action_list.php");
-        let _ = write_if_changed(&app_action_list_path, &app_action_list);
-        let _ = std::fs::create_dir_all(&fp_dir);
-        let _ = std::fs::write(&fp_path, new_fp);
+        must_write(&app_action_list_path, &app_action_list);
+        if let Err(e) =
+            std::fs::create_dir_all(&fp_dir).and_then(|()| std::fs::write(&fp_path, new_fp))
+        {
+            eprintln!("error: Could not write {}: {e}", fp_path.display());
+            std::process::exit(1);
+        }
     } // end 'phase7
     log_phase_elapsed("Phase 7", phase_7_started);
 
@@ -2129,6 +2126,34 @@ fn is_generated_class_name(class: &str) -> bool {
     GENERATED_CLASS_SUFFIXES
         .iter()
         .any(|suffix| class.ends_with(suffix))
+}
+
+/// `Console\\GenerationDirectoryAccess::check()`: creates a missing folder and needs write access.
+/// A real write also notices what the mode bits do not show, such as an immutable folder.
+fn generated_folders_are_writable(generated_root: &Path) -> bool {
+    let probe_name = format!(".fast-di-write-check-{}", std::process::id());
+    [
+        generated_root.to_path_buf(),
+        generated_root.join("code"),
+        generated_root.join("metadata"),
+    ]
+    .iter()
+    .all(|folder| {
+        let probe = folder.join(&probe_name);
+        std::fs::create_dir_all(folder)
+            .and_then(|()| std::fs::write(&probe, b""))
+            .and_then(|()| std::fs::remove_file(&probe))
+            .is_ok()
+    })
+}
+
+/// Writes a generated file. Returns whether its content changed. A failed write stops the compile,
+/// because the store would run with a file missing or out of date.
+fn must_write(path: &Path, content: &str) -> bool {
+    write_if_changed(path, content).unwrap_or_else(|e| {
+        eprintln!("error: Could not write {}: {e}", path.display());
+        std::process::exit(1);
+    })
 }
 
 fn progress_bar(len: u64, msg: &str) -> ProgressBar {
