@@ -208,3 +208,43 @@ fn child_item_without_a_sort_order_stays_last_when_it_is_the_last_item() {
         &["late", "own"],
     ));
 }
+
+#[test]
+fn later_file_with_another_item_type_drops_the_sort_order_of_an_earlier_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    class(root, "Base", TAKES_ITEMS);
+    write(root, "app/code/Acme/Zed/registration.php", "<?php\n");
+    write(
+        root,
+        "app/code/Acme/Zed/etc/module.xml",
+        "<config><module name=\"Acme_Zed\"/></config>\n",
+    );
+    write(
+        root,
+        "app/code/Acme/Zed/etc/di.xml",
+        "<config><type name=\"Acme\\On\\Model\\Base\"><arguments><argument name=\"things\" xsi:type=\"array\">\n<item name=\"replaced\" xsi:type=\"null\"/>\n</argument></arguments></type></config>\n",
+    );
+    compile(
+        root,
+        "<type name=\"Acme\\On\\Model\\Base\"><arguments><argument name=\"things\" xsi:type=\"array\">\n<item name=\"replaced\" sortOrder=\"20\" xsi:type=\"string\">r</item>\n<item name=\"none\" xsi:type=\"string\">n</item>\n</argument></arguments></type>",
+    );
+    write(
+        root,
+        "app/etc/config.php",
+        "<?php\nreturn [\n    'modules' => [\n        'Acme_On' => 1,\n        'Acme_Zed' => 1,\n    ],\n];\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_fast-di-compile"))
+        .arg("--magento-root")
+        .arg(root)
+        .arg("--fallback-php")
+        .arg(root.join("no-php-here"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_in_order(item_order(
+        &metadata(root),
+        "Acme\\\\On\\\\Model\\\\Base",
+        &["replaced", "none"],
+    ));
+}
