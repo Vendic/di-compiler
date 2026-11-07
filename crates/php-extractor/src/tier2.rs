@@ -588,8 +588,8 @@ fn resolve_type_in_hint(
             .split('|')
             .map(|part| {
                 let p = part.trim();
-                if is_primitive_type(p) || p.eq_ignore_ascii_case("null") {
-                    p.to_string()
+                if is_primitive_type(p) {
+                    p.to_ascii_lowercase()
                 } else {
                     resolve_type_hint(p, namespace, use_map)
                 }
@@ -598,7 +598,7 @@ fn resolve_type_in_hint(
         return format!("{}{}", prefix, resolved.join("|"));
     }
     if is_primitive_type(inner) {
-        return raw.to_string();
+        return raw.to_ascii_lowercase();
     }
     format!("{}{}", prefix, resolve_type_hint(inner, namespace, use_map))
 }
@@ -646,16 +646,18 @@ fn is_primitive_type(t: &str) -> bool {
     is_primitive_base(t)
 }
 
+/// PHP reads a reserved type name in any case. `integer`, `double` and `boolean` are not reserved,
+/// so `Boolean` can be a class. Those three keep their exact spelling here.
 fn is_primitive_base(t: &str) -> bool {
+    if matches!(t, "integer" | "double" | "boolean") {
+        return true;
+    }
     matches!(
-        t,
+        t.to_ascii_lowercase().as_str(),
         "int"
-            | "integer"
             | "float"
-            | "double"
             | "string"
             | "bool"
-            | "boolean"
             | "array"
             | "callable"
             | "iterable"
@@ -687,6 +689,32 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(php.as_bytes()).unwrap();
         extract_tier2(f.path())
+    }
+
+    #[test]
+    fn test_tier2_reserved_type_names_are_builtin_in_any_case() {
+        let result = extract(
+            "<?php\nnamespace Foo;\nclass Baz\n{\n    public function __construct(Array $a, ?String $b, Int|Null $c, Boolean $d) {}\n}\n",
+        );
+        let ExtractResult::Ok(info) = result else {
+            panic!("Expected Ok, got {result:?}");
+        };
+        let hints: Vec<_> = info
+            .constructor
+            .unwrap()
+            .params
+            .iter()
+            .map(|param| (param.type_hint.clone().unwrap(), param.is_primitive))
+            .collect();
+        assert_eq!(
+            hints,
+            [
+                ("array".to_string(), true),
+                ("?string".to_string(), true),
+                ("int|null".to_string(), true),
+                ("Foo\\Boolean".to_string(), false),
+            ]
+        );
     }
 
     #[test]
