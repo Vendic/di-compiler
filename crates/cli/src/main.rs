@@ -1636,7 +1636,12 @@ fn main() {
         // Build the case-normalisation index once from the interception class map.
         // All 7 area iterations reuse the same index; previously it was rebuilt
         // from scratch inside canonicalize_instance_reference_case on every call.
-        let case_index = build_case_index(&interception_class_map);
+        let mut case_index = build_case_index(&interception_class_map);
+        add_declared_constructor_classes(
+            &mut case_index,
+            &metadata_class_map,
+            composer_autoload.as_ref(),
+        );
 
         // Resolve every type once with global interception overrides baked in. Areas with
         // no di.xml of their own write this result as it is.
@@ -5438,6 +5443,36 @@ fn build_case_index(class_map: &FxHashMap<String, ClassInfo>) -> FxHashMap<Strin
         }
     }
     case_index.into_iter().map(|(k, (v, _))| (k, v)).collect()
+}
+
+/// `ClassReader::getConstructor()` keeps `ReflectionClass::getName()`, the name the file declares.
+/// A library is not scanned, and PHP loads it under any spelling its PSR-4 map lists, so only the
+/// file says which name that is.
+fn add_declared_constructor_classes(
+    case_index: &mut FxHashMap<String, String>,
+    class_map: &FxHashMap<String, ClassInfo>,
+    composer_index: Option<&ComposerAutoloadIndex>,
+) {
+    let library_classes: FxHashSet<&str> = class_map
+        .values()
+        .filter_map(|info| info.constructor.as_ref())
+        .flat_map(|constructor| &constructor.params)
+        .filter(|param| !param.is_primitive)
+        .filter_map(|param| param.type_hint.as_deref())
+        .map(|hint| hint.trim_start_matches('?').trim_start_matches('\\'))
+        .filter(|name| !name.contains(['|', '&']))
+        .filter(|name| !case_index.contains_key(&name.to_ascii_lowercase()))
+        .collect();
+    let declared: Vec<String> = library_classes
+        .into_par_iter()
+        .filter_map(|name| {
+            let info = composer_class_info(composer_index, name)?;
+            info.fqcn.eq_ignore_ascii_case(name).then_some(info.fqcn)
+        })
+        .collect();
+    for fqcn in declared {
+        case_index.insert(fqcn.to_ascii_lowercase(), fqcn);
+    }
 }
 
 /// Apply a pre-built case index to an args map (shared across all areas).
