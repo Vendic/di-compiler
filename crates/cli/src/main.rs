@@ -29,6 +29,7 @@ mod class_checks;
 mod compile_scope;
 mod di_xml_checks;
 mod file_level_checks;
+mod incompatible_modules;
 use class_checks::{ClassChecks, ScannedFile};
 use di_xml_checks::DiXmlCheck;
 use file_level_checks::run_file_level_checks;
@@ -564,6 +565,14 @@ fn main() {
         .magento_root
         .canonicalize()
         .unwrap_or(args.magento_root.clone());
+
+    // Before anything writes to or empties the output, so the store keeps its working output.
+    let enabled_modules = load_module_order_from_config_php(&magento_root, &args.fallback_php);
+    if let Some(message) = incompatible_modules::enabled_incompatible_modules(&enabled_modules) {
+        eprintln!("error: {message}");
+        std::process::exit(1);
+    }
+
     let generated_root = args
         .output
         .clone()
@@ -605,7 +614,6 @@ fn main() {
     // Phase 1 + 2: Walk PHP files + extract ClassInfo (parallel)
     // -----------------------------------------------------------------------
     let phase_1_2_started = Instant::now();
-    let enabled_modules = load_module_order_from_config_php(&magento_root, &args.fallback_php);
     let mut all_module_paths = read_module_paths(&magento_root);
     all_module_paths.extend(composer_registered_module_roots(&magento_root));
     let mut all_module_paths: Vec<PathBuf> = all_module_paths
