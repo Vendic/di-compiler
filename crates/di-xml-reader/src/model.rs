@@ -186,4 +186,67 @@ pub enum Argument {
         value: String,
         sort_order: i32,
     },
+    /// A node `Interpreter\\Composite` cannot read: no `xsi:type`, or one it does not know. A file
+    /// can leave the type to another file of its scope, so this only counts after the merge.
+    Untyped {
+        name: String,
+        /// Empty when the node has no `xsi:type`.
+        xsi_type: String,
+        value: String,
+        items: Vec<Argument>,
+        sort_order: i32,
+    },
+}
+
+impl Argument {
+    /// True for this node or any item below it.
+    pub fn has_untyped(&self) -> bool {
+        match self {
+            Argument::Untyped { .. } => true,
+            Argument::Array { items, .. } => items.iter().any(Argument::has_untyped),
+            _ => false,
+        }
+    }
+}
+
+impl DiConfig {
+    pub fn has_untyped_argument(&self) -> bool {
+        self.type_configs
+            .values()
+            .any(|config| config.arguments.iter().any(Argument::has_untyped))
+    }
+
+    /// What `Interpreter\\Composite::evaluate()` stops with for this config, as one merged scope.
+    pub fn untyped_argument_failure(&self) -> Option<String> {
+        let mut failures: Vec<String> = Vec::new();
+        for (type_name, config) in &self.type_configs {
+            for argument in &config.arguments {
+                collect_untyped(argument, "", type_name, &mut failures);
+            }
+        }
+        failures.sort();
+        failures.into_iter().next()
+    }
+}
+
+fn collect_untyped(argument: &Argument, parent: &str, type_name: &str, out: &mut Vec<String>) {
+    match argument {
+        Argument::Untyped { name, xsi_type, .. } => {
+            let reason = if xsi_type.is_empty() {
+                "Value for key \"xsi:type\" is missing in the argument data.".to_string()
+            } else {
+                format!("Argument interpreter named '{xsi_type}' has not been defined.")
+            };
+            out.push(format!(
+                "{reason} Type {type_name}, argument {parent}{name}"
+            ));
+        }
+        Argument::Array { name, items, .. } => {
+            let path = format!("{parent}{name}/");
+            for item in items {
+                collect_untyped(item, &path, type_name, out);
+            }
+        }
+        _ => {}
+    }
 }

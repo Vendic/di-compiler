@@ -118,11 +118,7 @@ pub fn parse_di_xml_bytes_unfolded(content: &[u8]) -> Result<DiConfig, Error> {
                     "argument" if in_arguments => {
                         // Self-closing argument (e.g. xsi:type="null") — push and immediately pop
                         let arg_name = attrs.get("name").cloned().unwrap_or_default();
-                        let xsi_type = attrs
-                            .get("xsi:type")
-                            .or_else(|| attrs.get("type"))
-                            .cloned()
-                            .unwrap_or_default();
+                        let xsi_type = attrs.get("xsi:type").cloned().unwrap_or_default();
                         let shared = attrs.get("shared").map(|s| s != "false");
                         let ctx = ArgContext {
                             name: arg_name,
@@ -147,11 +143,7 @@ pub fn parse_di_xml_bytes_unfolded(content: &[u8]) -> Result<DiConfig, Error> {
                     "item" if !arg_stack.is_empty() => {
                         // Self-closing item — push and immediately pop into parent
                         let arg_name = attrs.get("name").cloned().unwrap_or_default();
-                        let xsi_type = attrs
-                            .get("xsi:type")
-                            .or_else(|| attrs.get("type"))
-                            .cloned()
-                            .unwrap_or_default();
+                        let xsi_type = attrs.get("xsi:type").cloned().unwrap_or_default();
                         let sort_order: i32 = attrs
                             .get("sortOrder")
                             .and_then(|s| s.parse().ok())
@@ -250,11 +242,7 @@ pub fn parse_di_xml_bytes_unfolded(content: &[u8]) -> Result<DiConfig, Error> {
                     }
                     "argument" if in_arguments => {
                         let arg_name = attrs.get("name").cloned().unwrap_or_default();
-                        let xsi_type = attrs
-                            .get("xsi:type")
-                            .or_else(|| attrs.get("type"))
-                            .cloned()
-                            .unwrap_or_default();
+                        let xsi_type = attrs.get("xsi:type").cloned().unwrap_or_default();
                         let shared = attrs.get("shared").map(|s| s != "false");
                         arg_stack.push(ArgContext {
                             name: arg_name,
@@ -267,11 +255,7 @@ pub fn parse_di_xml_bytes_unfolded(content: &[u8]) -> Result<DiConfig, Error> {
                     }
                     "item" if !arg_stack.is_empty() => {
                         let arg_name = attrs.get("name").cloned().unwrap_or_default();
-                        let xsi_type = attrs
-                            .get("xsi:type")
-                            .or_else(|| attrs.get("type"))
-                            .cloned()
-                            .unwrap_or_default();
+                        let xsi_type = attrs.get("xsi:type").cloned().unwrap_or_default();
                         let sort_order: i32 = attrs
                             .get("sortOrder")
                             .and_then(|s| s.parse().ok())
@@ -391,14 +375,7 @@ fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
         return None;
     }
     let so = ctx.sort_order;
-    // `Config\Dom` merges the files before it reads any type, so an argument can leave `xsi:type`
-    // to an earlier file. With items, that type can only be array.
-    let xsi_type = if ctx.xsi_type.is_empty() && !ctx.items.is_empty() {
-        "array"
-    } else {
-        ctx.xsi_type.as_str()
-    };
-    let arg = match xsi_type {
+    let arg = match ctx.xsi_type.as_str() {
         "object" => Argument::Object {
             name,
             value: normalize(&ctx.text),
@@ -446,9 +423,11 @@ fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
             value: ctx.text,
             sort_order: so,
         },
-        _ => Argument::String {
+        _ => Argument::Untyped {
             name,
+            xsi_type: ctx.xsi_type,
             value: ctx.text,
+            items: ctx.items.into_iter().map(|(_, arg)| arg).collect(),
             sort_order: so,
         },
     };
