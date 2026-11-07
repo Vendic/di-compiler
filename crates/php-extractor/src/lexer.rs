@@ -594,7 +594,7 @@ impl<'a> Scanner<'a> {
     fn resolve_type(&self, raw: &str) -> String {
         // Primitives stay as-is — they are never FQCNs.
         if is_primitive_type(raw) {
-            return raw.to_string();
+            return raw.to_ascii_lowercase();
         }
         // The first segment determines whether there's a use-import match.
         let first = raw.split('\\').next().unwrap_or(raw);
@@ -1561,16 +1561,18 @@ fn is_primitive_type(t: &str) -> bool {
     is_primitive_base(t)
 }
 
+/// PHP reads a reserved type name in any case. `integer`, `double` and `boolean` are not reserved,
+/// so `Boolean` can be a class. Those three keep their exact spelling here.
 fn is_primitive_base(t: &str) -> bool {
+    if matches!(t, "integer" | "double" | "boolean") {
+        return true;
+    }
     matches!(
-        t,
+        t.to_ascii_lowercase().as_str(),
         "int"
-            | "integer"
             | "float"
-            | "double"
             | "string"
             | "bool"
-            | "boolean"
             | "array"
             | "callable"
             | "iterable"
@@ -1597,6 +1599,31 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(php.as_bytes()).unwrap();
         f
+    }
+
+    #[test]
+    fn test_reserved_type_names_are_builtin_in_any_case() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Baz\n{\n    public function __construct(Array $a, OBJECT $b, ?String $c, Int|Null $d, Boolean $e) {}\n}\n",
+        )
+        .unwrap();
+        let hints: Vec<_> = info
+            .constructor
+            .unwrap()
+            .params
+            .iter()
+            .map(|param| (param.type_hint.clone().unwrap(), param.is_primitive))
+            .collect();
+        assert_eq!(
+            hints,
+            [
+                ("array".to_string(), true),
+                ("object".to_string(), true),
+                ("?string".to_string(), true),
+                ("int|null".to_string(), true),
+                ("Foo\\Boolean".to_string(), false),
+            ]
+        );
     }
 
     #[test]
