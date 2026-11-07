@@ -220,8 +220,11 @@ fn merge_type_config(dst: &mut TypeConfig, src: TypeConfig) {
 /// For Array arguments both sides are merged recursively by item name.
 /// All other types: last-wins (src replaces dst).
 fn merge_argument(dst: &mut Argument, mut src: Argument) {
-    // `Config\Dom` merges node by node, so an attribute of an earlier file stays.
-    if *sort_order_of(&mut src) == 0 {
+    // `Config\Dom::_mergeNode()` merges node by node, so an attribute of an earlier file stays.
+    // A node with another `xsi:type` replaces the earlier node, with its attributes.
+    if std::mem::discriminant(&*dst) == std::mem::discriminant(&src)
+        && *sort_order_of(&mut src) == 0
+    {
         *sort_order_of(&mut src) = *sort_order_of(dst);
     }
     let sort_order = *sort_order_of(&mut src);
