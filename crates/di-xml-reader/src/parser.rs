@@ -387,15 +387,17 @@ fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
             value: ctx.text,
             sort_order: so,
         },
-        "boolean" => Argument::Boolean {
-            name,
-            value: ctx.text == "true" || ctx.text == "1",
-            sort_order: so,
-        },
+        "boolean" if matches!(ctx.text.as_str(), "" | "true" | "1" | "false" | "0") => {
+            Argument::Boolean {
+                name,
+                value: ctx.text == "true" || ctx.text == "1",
+                sort_order: so,
+            }
+        }
         // PHP's Number::evaluate() returns the raw XML string (not cast to int/float).
         // var_export() then quotes it as a string in metadata. Use Argument::String so
         // render_scalar outputs it quoted, matching PHP truth.
-        "number" => Argument::String {
+        "number" if ctx.text.is_empty() || is_php_numeric(&ctx.text) => Argument::String {
             name,
             value: ctx.text,
             sort_order: so,
@@ -432,6 +434,13 @@ fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
         },
     };
     Some(arg)
+}
+
+/// PHP 8's `is_numeric()`: a decimal number with optional exponent and surrounding whitespace.
+fn is_php_numeric(text: &str) -> bool {
+    let number = text.trim_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let digits = number.strip_prefix(['+', '-']).unwrap_or(number);
+    digits.starts_with(|c: char| c.is_ascii_digit() || c == '.') && digits.parse::<f64>().is_ok()
 }
 
 fn local_name(name: &[u8]) -> String {

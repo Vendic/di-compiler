@@ -255,13 +255,21 @@ fn merge_argument(dst: &mut Argument, mut src: Argument) {
             // `Config\Dom` merges node by node, so an attribute of an earlier file stays.
             if let (
                 Argument::Object {
-                    shared: Some(earlier),
+                    shared: earlier,
+                    value: earlier_value,
                     ..
                 },
-                Argument::Object { shared: later, .. },
+                Argument::Object {
+                    shared: later,
+                    value: later_value,
+                    ..
+                },
             ) = (&*dst, &mut src)
             {
-                later.get_or_insert(*earlier);
+                *later = later.or(*earlier);
+                if later_value.is_empty() {
+                    later_value.clone_from(earlier_value);
+                }
             }
             *dst = src;
         }

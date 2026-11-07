@@ -787,8 +787,8 @@ fn main() {
     let (primary_scope, global_scope): (Vec<_>, Vec<_>) = global_di_path_configs
         .iter()
         .partition(|(path, _)| path.starts_with(&app_etc));
-    stop_on_untyped_argument(primary_scope.into_iter().map(|(_, config)| config));
-    stop_on_untyped_argument(global_scope.into_iter().map(|(_, config)| config));
+    stop_on_unreadable_argument(primary_scope.into_iter().map(|(_, config)| config));
+    stop_on_unreadable_argument(global_scope.into_iter().map(|(_, config)| config));
 
     // Two-phase merge replicating PHP's Config::_mergeConfiguration behaviour:
     //   Phase 1: deep-merge all module di.xml files together (items accumulate by name)
@@ -843,10 +843,10 @@ fn main() {
         .filter_map(|path| area_di_xml_cache.get(*path).cloned())
         .collect();
 
-    if extra_configs.iter().any(DiConfig::has_untyped_argument) {
+    if extra_configs.iter().any(DiConfig::has_unreadable_argument) {
         for area in &areas {
             let area_files = find_di_xml_files_for_area(&magento_root, area, &enabled_modules);
-            stop_on_untyped_argument(
+            stop_on_unreadable_argument(
                 area_files
                     .iter()
                     .filter(|path| !di_xml_files_set.contains(path))
@@ -2298,13 +2298,13 @@ fn stop_compile(message: &str) -> ! {
 
 /// `Mapper\\Dom::convert()` evaluates each argument after `Config\\Dom` merged the files of one
 /// scope, so a type from another file of the scope counts and one from another scope does not.
-fn stop_on_untyped_argument<'a>(scope: impl Iterator<Item = &'a DiConfig>) {
+fn stop_on_unreadable_argument<'a>(scope: impl Iterator<Item = &'a DiConfig>) {
     let files: Vec<&DiConfig> = scope.collect();
-    if !files.iter().any(|config| config.has_untyped_argument()) {
+    if !files.iter().any(|config| config.has_unreadable_argument()) {
         return;
     }
     let merged = merge_configs(files.into_iter().cloned().collect());
-    if let Some(failure) = merged.untyped_argument_failure() {
+    if let Some(failure) = merged.unreadable_argument_failure() {
         stop_compile(&failure);
     }
 }

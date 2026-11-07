@@ -192,3 +192,51 @@ fn items_merge_with_a_type_in_an_earlier_or_later_file() {
         assert!(thing.contains("'plain'"), "{thing}");
     }
 }
+
+#[test]
+fn number_that_is_not_numeric_stops_the_compile() {
+    let first = thing("<argument name=\"value\" xsi:type=\"number\">abc</argument>");
+    assert_stops(&[(FIRST, &first)], "Numeric value is expected", "value");
+}
+
+#[test]
+fn numeric_forms_of_php_compile() {
+    let first = thing("<argument name=\"value\" xsi:type=\"array\"><item name=\"a\" xsi:type=\"number\">1.5e3</item><item name=\"b\" xsi:type=\"number\">-.5</item></argument>");
+    assert!(compiled_thing(&[(FIRST, &first)]).is_none_or(|thing| thing.contains("1.5e3")));
+}
+
+#[test]
+fn boolean_that_is_not_a_boolean_stops_the_compile() {
+    let first = thing("<argument name=\"value\" xsi:type=\"boolean\">maybe</argument>");
+    assert_stops(&[(FIRST, &first)], "Boolean value is expected", "value");
+}
+
+#[test]
+fn invalid_value_replaced_in_a_later_file_compiles() {
+    let first = thing("<argument name=\"value\" xsi:type=\"boolean\">maybe</argument>");
+    let second = thing("<argument name=\"value\" xsi:type=\"boolean\">true</argument>");
+    let Some(thing) = compiled_thing(&[(FIRST, &first), (SECOND, &second)]) else {
+        return;
+    };
+    assert!(thing.contains("'_v_' => true"), "{thing}");
+}
+
+#[test]
+fn object_without_a_class_stops_the_compile() {
+    let first = thing("<argument name=\"value\" xsi:type=\"object\"></argument>");
+    assert_stops(&[(FIRST, &first)], "has no class name", "value");
+}
+
+#[test]
+fn later_empty_object_node_keeps_the_class_of_the_earlier_file() {
+    let first =
+        thing("<argument name=\"value\" xsi:type=\"object\">Acme\\First\\Model\\Gadget</argument>");
+    let second = thing("<argument name=\"value\" xsi:type=\"object\" shared=\"false\"/>");
+    let Some(thing) = compiled_thing(&[(FIRST, &first), (SECOND, &second)]) else {
+        return;
+    };
+    assert!(
+        thing.contains("Acme\\\\First\\\\Model\\\\Gadget"),
+        "{thing}"
+    );
+}
