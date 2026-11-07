@@ -186,8 +186,9 @@ pub enum Argument {
         value: String,
         sort_order: i32,
     },
-    /// A node `Interpreter\\Composite` cannot read: no `xsi:type`, or one it does not know. A file
-    /// can leave the type to another file of its scope, so this only counts after the merge.
+    /// A node `Interpreter\\Composite` stops on: no `xsi:type`, one it does not know, or a number or
+    /// boolean with a value its interpreter rejects. Another file of the scope can still give the
+    /// type or a new value, so this only counts after the merge.
     Untyped {
         name: String,
         /// Empty when the node has no `xsi:type`.
@@ -200,28 +201,29 @@ pub enum Argument {
 
 impl Argument {
     /// True for this node or any item below it.
-    pub fn has_untyped(&self) -> bool {
+    pub fn is_unreadable(&self) -> bool {
         match self {
             Argument::Untyped { .. } => true,
-            Argument::Array { items, .. } => items.iter().any(Argument::has_untyped),
+            Argument::Object { value, .. } => value.is_empty(),
+            Argument::Array { items, .. } => items.iter().any(Argument::is_unreadable),
             _ => false,
         }
     }
 }
 
 impl DiConfig {
-    pub fn has_untyped_argument(&self) -> bool {
+    pub fn has_unreadable_argument(&self) -> bool {
         self.type_configs
             .values()
-            .any(|config| config.arguments.iter().any(Argument::has_untyped))
+            .any(|config| config.arguments.iter().any(Argument::is_unreadable))
     }
 
-    /// What `Interpreter\\Composite::evaluate()` stops with for this config, as one merged scope.
-    pub fn untyped_argument_failure(&self) -> Option<String> {
+    /// What `Mapper\\Dom::convert()` stops with for this config, as one merged scope.
+    pub fn unreadable_argument_failure(&self) -> Option<String> {
         let mut failures: Vec<String> = Vec::new();
         for (type_name, config) in &self.type_configs {
             for argument in &config.arguments {
-                collect_untyped(argument, "", type_name, &mut failures);
+                collect_unreadable(argument, "", type_name, &mut failures);
             }
         }
         failures.sort();
@@ -229,22 +231,29 @@ impl DiConfig {
     }
 }
 
-fn collect_untyped(argument: &Argument, parent: &str, type_name: &str, out: &mut Vec<String>) {
+fn collect_unreadable(argument: &Argument, parent: &str, type_name: &str, out: &mut Vec<String>) {
+    let mut fail = |name: &str, reason: String| {
+        out.push(format!(
+            "{reason} Type {type_name}, argument {parent}{name}"
+        ));
+    };
     match argument {
         Argument::Untyped { name, xsi_type, .. } => {
-            let reason = if xsi_type.is_empty() {
-                "Value for key \"xsi:type\" is missing in the argument data.".to_string()
-            } else {
-                format!("Argument interpreter named '{xsi_type}' has not been defined.")
+            let reason = match xsi_type.as_str() {
+                "" => "Value for key \"xsi:type\" is missing in the argument data.".to_string(),
+                "number" => "Numeric value is expected.".to_string(),
+                "boolean" => "Boolean value is expected.".to_string(),
+                other => format!("Argument interpreter named '{other}' has not been defined."),
             };
-            out.push(format!(
-                "{reason} Type {type_name}, argument {parent}{name}"
-            ));
+            fail(name, reason);
+        }
+        Argument::Object { name, value, .. } if value.is_empty() => {
+            fail(name, "Object argument has no class name.".to_string());
         }
         Argument::Array { name, items, .. } => {
             let path = format!("{parent}{name}/");
             for item in items {
-                collect_untyped(item, &path, type_name, out);
+                collect_unreadable(item, &path, type_name, out);
             }
         }
         _ => {}
