@@ -221,14 +221,27 @@ fn merge_type_config(dst: &mut TypeConfig, src: TypeConfig) {
 /// All other types: last-wins (src replaces dst).
 fn merge_argument(dst: &mut Argument, mut src: Argument) {
     // `Config\Dom::_mergeNode()` merges node by node, so an attribute of an earlier file stays.
-    // A node with another `xsi:type` replaces the earlier node, with its attributes.
-    if std::mem::discriminant(&*dst) == std::mem::discriminant(&src)
+    // A node with another `xsi:type` replaces the earlier node, with its attributes. A node
+    // without one is the same node.
+    if (std::mem::discriminant(&*dst) == std::mem::discriminant(&src)
+        || has_no_type(dst)
+        || has_no_type(&src))
         && *sort_order_of(&mut src) == 0
     {
         *sort_order_of(&mut src) = *sort_order_of(dst);
     }
     let sort_order = *sort_order_of(&mut src);
     *sort_order_of(dst) = sort_order;
+    if has_no_type(&src) {
+        if let Argument::Untyped { value, items, .. } = src {
+            take_node_without_type(dst, value, items);
+        }
+        return;
+    }
+    if has_no_type(dst) {
+        give_type_to_earlier_node(dst, src);
+        return;
+    }
     match (dst, src) {
         (
             Argument::Array {
@@ -237,16 +250,7 @@ fn merge_argument(dst: &mut Argument, mut src: Argument) {
             Argument::Array {
                 items: src_items, ..
             },
-        ) => {
-            for src_item in src_items {
-                let name = arg_name(&src_item).to_string();
-                if let Some(existing) = dst_items.iter_mut().find(|a| arg_name(a) == name) {
-                    merge_argument(existing, src_item);
-                } else {
-                    dst_items.push(src_item);
-                }
-            }
-        }
+        ) => merge_items(dst_items, src_items),
         (dst, mut src) => {
             // `Config\Dom` merges node by node, so an attribute of an earlier file stays.
             if let (
@@ -264,6 +268,54 @@ fn merge_argument(dst: &mut Argument, mut src: Argument) {
     }
 }
 
+fn has_no_type(arg: &Argument) -> bool {
+    matches!(arg, Argument::Untyped { xsi_type, .. } if xsi_type.is_empty())
+}
+
+fn merge_items(dst_items: &mut Vec<Argument>, src_items: Vec<Argument>) {
+    for src_item in src_items {
+        let name = arg_name(&src_item).to_string();
+        if let Some(existing) = dst_items.iter_mut().find(|a| arg_name(a) == name) {
+            merge_argument(existing, src_item);
+        } else {
+            dst_items.push(src_item);
+        }
+    }
+}
+
+/// A later node without `xsi:type`: the earlier node keeps its type and takes the new content.
+fn take_node_without_type(dst: &mut Argument, later_value: String, later_items: Vec<Argument>) {
+    match dst {
+        Argument::Array { items, .. } => merge_items(items, later_items),
+        Argument::Untyped { value, items, .. } => {
+            if !later_value.is_empty() {
+                *value = later_value;
+            }
+            merge_items(items, later_items);
+        }
+        _ if later_value.is_empty() => {}
+        Argument::Object { value, .. } => *value = later_value.trim().to_string(),
+        Argument::String { value, .. }
+        | Argument::Number { value, .. }
+        | Argument::Init { value, .. }
+        | Argument::Const { value, .. } => *value = later_value,
+        Argument::Boolean { value, .. } => *value = later_value == "true" || later_value == "1",
+        Argument::Null { .. } => {}
+    }
+}
+
+/// An earlier node without `xsi:type` takes the type of the later node. Its items stay.
+fn give_type_to_earlier_node(dst: &mut Argument, mut src: Argument) {
+    if let (Argument::Untyped { items, .. }, Argument::Array { items: later, .. }) =
+        (&mut *dst, &mut src)
+    {
+        let mut merged = std::mem::take(items);
+        merge_items(&mut merged, std::mem::take(later));
+        *later = merged;
+    }
+    *dst = src;
+}
+
 fn sort_order_of(arg: &mut Argument) -> &mut i32 {
     match arg {
         Argument::Object { sort_order, .. }
@@ -273,7 +325,8 @@ fn sort_order_of(arg: &mut Argument) -> &mut i32 {
         | Argument::Null { sort_order, .. }
         | Argument::Array { sort_order, .. }
         | Argument::Init { sort_order, .. }
-        | Argument::Const { sort_order, .. } => sort_order,
+        | Argument::Const { sort_order, .. }
+        | Argument::Untyped { sort_order, .. } => sort_order,
     }
 }
 
@@ -287,6 +340,7 @@ fn arg_name(arg: &Argument) -> &str {
         Argument::Array { name, .. } => name,
         Argument::Init { name, .. } => name,
         Argument::Const { name, .. } => name,
+        Argument::Untyped { name, .. } => name,
     }
 }
 

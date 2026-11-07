@@ -783,6 +783,13 @@ fn main() {
         .collect();
     pb.finish_with_message("done");
 
+    let app_etc = magento_root.join("app/etc");
+    let (primary_scope, global_scope): (Vec<_>, Vec<_>) = global_di_path_configs
+        .iter()
+        .partition(|(path, _)| path.starts_with(&app_etc));
+    stop_on_untyped_argument(primary_scope.into_iter().map(|(_, config)| config));
+    stop_on_untyped_argument(global_scope.into_iter().map(|(_, config)| config));
+
     // Two-phase merge replicating PHP's Config::_mergeConfiguration behaviour:
     //   Phase 1: deep-merge all module di.xml files together (items accumulate by name)
     //   Phase 2: apply merged module result on app/etc/di.xml with shallow arg replacement
@@ -835,6 +842,18 @@ fn main() {
         .iter()
         .filter_map(|path| area_di_xml_cache.get(*path).cloned())
         .collect();
+
+    if extra_configs.iter().any(DiConfig::has_untyped_argument) {
+        for area in &areas {
+            let area_files = find_di_xml_files_for_area(&magento_root, area, &enabled_modules);
+            stop_on_untyped_argument(
+                area_files
+                    .iter()
+                    .filter(|path| !di_xml_files_set.contains(path))
+                    .filter_map(|path| area_di_xml_cache.get(path)),
+            );
+        }
+    }
 
     let mut scanner_di_configs = global_di_configs.clone();
     scanner_di_configs.extend(extra_configs.iter().cloned().map(folded));
@@ -2277,6 +2296,19 @@ fn stop_compile(message: &str) -> ! {
     std::process::exit(1);
 }
 
+/// `Mapper\\Dom::convert()` evaluates each argument after `Config\\Dom` merged the files of one
+/// scope, so a type from another file of the scope counts and one from another scope does not.
+fn stop_on_untyped_argument<'a>(scope: impl Iterator<Item = &'a DiConfig>) {
+    let files: Vec<&DiConfig> = scope.collect();
+    if !files.iter().any(|config| config.has_untyped_argument()) {
+        return;
+    }
+    let merged = merge_configs(files.into_iter().cloned().collect());
+    if let Some(failure) = merged.untyped_argument_failure() {
+        stop_compile(&failure);
+    }
+}
+
 /// `Console\\GenerationDirectoryAccess::check()`: creates a missing folder and needs write access.
 /// A real write also notices what the mode bits do not show, such as an immutable folder.
 fn generated_folders_are_writable(generated_root: &Path) -> bool {
@@ -2412,6 +2444,8 @@ fn hash_di_argument(h: &mut impl std::hash::Hasher, arg: &di_xml_reader::Argumen
             h.write_u8(0);
             h.write_i32(*sort_order);
         }
+        // The compile stops on these before anything is hashed.
+        Argument::Untyped { .. } => {}
     }
 }
 
@@ -3063,7 +3097,8 @@ fn upsert_type_argument(di_config: &mut DiConfig, type_name: &str, argument: Arg
         | Argument::Null { name, .. }
         | Argument::Array { name, .. }
         | Argument::Init { name, .. }
-        | Argument::Const { name, .. } => name,
+        | Argument::Const { name, .. }
+        | Argument::Untyped { name, .. } => name,
     };
 
     if let Some(existing) = tc.arguments.iter_mut().find(|a| match a {
@@ -3074,7 +3109,8 @@ fn upsert_type_argument(di_config: &mut DiConfig, type_name: &str, argument: Arg
         | Argument::Null { name, .. }
         | Argument::Array { name, .. }
         | Argument::Init { name, .. }
-        | Argument::Const { name, .. } => name == arg_name,
+        | Argument::Const { name, .. }
+        | Argument::Untyped { name, .. } => name == arg_name,
     }) {
         *existing = argument;
     } else {
@@ -6194,7 +6230,8 @@ fn compiled_areas(di_config: &DiConfig) -> Vec<String> {
         | Argument::Null { name, .. }
         | Argument::Array { name, .. }
         | Argument::Init { name, .. }
-        | Argument::Const { name, .. }) = item;
+        | Argument::Const { name, .. }
+        | Argument::Untyped { name, .. }) = item;
         if !areas.iter().any(|area| area == name) {
             areas.push(name.clone());
         }

@@ -466,7 +466,8 @@ fn clear_sort_order(arg: &mut Argument) {
         | Argument::Null { sort_order, .. }
         | Argument::Array { sort_order, .. }
         | Argument::Init { sort_order, .. }
-        | Argument::Const { sort_order, .. } => *sort_order = 0,
+        | Argument::Const { sort_order, .. }
+        | Argument::Untyped { sort_order, .. } => *sort_order = 0,
     }
 }
 
@@ -588,7 +589,8 @@ fn resolve_di_argument(
                 ResolvedArgValue::NonSharedInstance(concrete)
             }
         }
-        Argument::String { value, .. } => {
+        // `Untyped` never gets here: the compile stops on it after the merge.
+        Argument::String { value, .. } | Argument::Untyped { value, .. } => {
             ResolvedArgValue::Scalar(ResolvedScalar::String(value.clone()))
         }
         Argument::Boolean { value, .. } => ResolvedArgValue::Scalar(ResolvedScalar::Bool(*value)),
@@ -1100,7 +1102,7 @@ fn is_configured_argument_array(items: &[Argument]) -> bool {
 
 fn resolve_plain_array_value(arg: &Argument) -> ResolvedArrayValue {
     match arg {
-        Argument::String { value, .. } => {
+        Argument::String { value, .. } | Argument::Untyped { value, .. } => {
             ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone()))
         }
         Argument::Boolean { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::Bool(*value)),
@@ -1140,7 +1142,8 @@ fn argument_name(arg: &Argument) -> &str {
         | Argument::Null { name, .. }
         | Argument::Array { name, .. }
         | Argument::Init { name, .. }
-        | Argument::Const { name, .. } => name.as_str(),
+        | Argument::Const { name, .. }
+        | Argument::Untyped { name, .. } => name.as_str(),
     }
 }
 
@@ -1153,7 +1156,8 @@ fn argument_sort_order(arg: &Argument) -> i32 {
         | Argument::Null { sort_order, .. }
         | Argument::Array { sort_order, .. }
         | Argument::Init { sort_order, .. }
-        | Argument::Const { sort_order, .. } => *sort_order,
+        | Argument::Const { sort_order, .. }
+        | Argument::Untyped { sort_order, .. } => *sort_order,
     }
 }
 
