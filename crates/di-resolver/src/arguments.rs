@@ -577,12 +577,16 @@ fn resolve_di_argument(
                     .contains_key(&name.to_ascii_lowercase());
             // For real class / interface references, apply the full preference chain
             // (including interception preferences so intercepted concretes become \Interceptor).
+            // `ArgumentsResolver::getInstanceArgument()` calls `isShared()` on the argument
+            // as di.xml names it. Preferences, the Interceptor among them, replace the name
+            // only afterwards (`InterceptorSubstitution`, `PreferencesResolving`), so they
+            // never change the shared decision.
+            let is_shared = shared.unwrap_or_else(|| di_config.is_shared(&name));
             let concrete = if is_virtual_type && !has_explicit_preference {
                 name
             } else {
                 di_config.get_preference(value)
             };
-            let is_shared = shared.unwrap_or_else(|| di_config.is_shared(&concrete));
             if is_shared {
                 ResolvedArgValue::SharedInstance(concrete)
             } else {
