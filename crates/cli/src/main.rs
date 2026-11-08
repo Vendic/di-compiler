@@ -6527,7 +6527,7 @@ fn parse_extension_attributes_files(
     }
 
     for attrs in out.values_mut() {
-        *attrs = dedupe_attributes_keep_last(attrs.clone());
+        *attrs = merge_redeclared_attributes(std::mem::take(attrs));
     }
 
     out
@@ -6558,15 +6558,20 @@ fn maybe_collect_extension_attribute(
         });
 }
 
-fn dedupe_attributes_keep_last(attrs: Vec<ExtensionAttributeSpec>) -> Vec<ExtensionAttributeSpec> {
-    let mut seen = FxHashSet::default();
-    let mut out = Vec::new();
-    for attr in attrs.into_iter().rev() {
-        if seen.insert(attr.code.clone()) {
-            out.push(attr);
+/// Merge attributes that more than one file declares, as `Magento\Framework\Config\Dom::_mergeNode()`
+/// does: the attribute keeps the place of its first declaration and takes the type of the last.
+fn merge_redeclared_attributes(attrs: Vec<ExtensionAttributeSpec>) -> Vec<ExtensionAttributeSpec> {
+    let mut index_by_code: FxHashMap<String, usize> = FxHashMap::default();
+    let mut out: Vec<ExtensionAttributeSpec> = Vec::new();
+    for attr in attrs {
+        match index_by_code.get(&attr.code) {
+            Some(&index) => out[index].php_type = attr.php_type,
+            None => {
+                index_by_code.insert(attr.code.clone(), out.len());
+                out.push(attr);
+            }
         }
     }
-    out.reverse();
     out
 }
 
