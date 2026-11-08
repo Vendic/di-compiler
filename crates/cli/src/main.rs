@@ -26,6 +26,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 mod class_checks;
+mod cli_boot;
 mod compile_scope;
 mod di_xml_checks;
 mod file_level_checks;
@@ -930,6 +931,26 @@ fn main() {
         }
     }
 
+    // `bin/magento` creates the registered command lists before the compile starts, and
+    // Magento generates what they ask for. The compile then finds those files.
+    let boot = cli_boot::classes_built_at_boot(
+        &cli_boot::registered_command_lists(&magento_root),
+        &|name| {
+            class_map
+                .get(name)
+                .or_else(|| disabled_class_map.get(name))
+                .cloned()
+                .or_else(|| composer_class_info(composer_autoload.as_ref(), name))
+        },
+        &|name| class_map.contains_key(name),
+        &di_config.preferences,
+        &is_generated_class_name,
+    );
+    let classes_asked_for_by_files: FxHashSet<String> = classes_asked_for_by_files
+        .into_iter()
+        .chain(boot.asked.iter().cloned())
+        .collect();
+
     // Files only ask for a proxy when PHP found its target class.
     extra_existing_proxy_targets.extend(
         classes_asked_for_by_files
@@ -1052,6 +1073,11 @@ fn main() {
     let disabled_ancestors = collect_disabled_ancestors(&class_map, &disabled_class_map);
     let mut interception_class_map = class_map.clone();
     interception_class_map.extend(disabled_ancestors.clone());
+    for (class, info) in &boot.built {
+        interception_class_map
+            .entry(class.clone())
+            .or_insert_with(|| info.clone());
+    }
     augment_with_composer_plugin_owner_classes(
         &mut interception_class_map,
         &interception_di_config,
@@ -1588,7 +1614,8 @@ fn main() {
         // ClassesScanner never lists these, so Magento gives them no arguments entry.
         argument_type_names.retain(|name| {
             let class = name.strip_suffix("\\Interceptor").unwrap_or(name);
-            class_map.contains_key(class) || !disabled_class_map.contains_key(class)
+            class_map.contains_key(class)
+                || !(disabled_class_map.contains_key(class) || boot.built.contains_key(class))
         });
         let argument_type_names = std::sync::Arc::new(argument_type_names);
         let mut interception_type_names = build_interception_type_names(
@@ -1602,6 +1629,9 @@ fn main() {
             &proxy_deferred,
             &extension_specs,
         );
+        // The scan does not list a class that only the console boot creates. Its generated
+        // interceptor is listed, because the compile finds that file in `generated/code`.
+        interception_type_names.retain(|name| !boot.built.contains_key(name));
         // `Config::generateIntercepted()` marks every plugin owner in every scope, even
         // when the owner's module is disabled.
         interception_type_names.extend(
