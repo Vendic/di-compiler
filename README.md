@@ -78,6 +78,19 @@ For ARM64, change the platform in the command to `--platform linux/arm64`. The r
 
 A macOS or Windows host needs a native build for that operating system or must run the compiler inside Docker.
 
+#### Or download a release binary
+
+Each [release](https://github.com/Vendic/di-compiler/releases) has a binary for Linux and macOS, on arm64 and amd64, and a `checksums.txt`:
+
+```bash
+curl -fsSLO https://github.com/Vendic/di-compiler/releases/download/0.1.0/fast-di-compile-linux-amd64
+curl -fsSLO https://github.com/Vendic/di-compiler/releases/download/0.1.0/checksums.txt
+sha256sum --check --ignore-missing checksums.txt
+chmod +x fast-di-compile-linux-amd64
+```
+
+The Linux binaries are built on Debian bookworm and need glibc 2.34 or newer (Ubuntu 22.04, Debian 12 and later). A release is made with `scripts/release.sh <version>` on a Mac with Apple silicon and Docker. The script header lists what it checks.
+
 ### 2. Compile your Magento project
 
 Set `/path/to/magento` to your Magento root:
