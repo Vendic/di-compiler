@@ -100,7 +100,7 @@ By default the output goes to `generated/code` and `generated/metadata` in your 
 
 ### Modules it does not support
 
-The compiler stops with exit code 1, before it changes any output, when `app/etc/config.php` enables one of these modules. A store with such a module has to use `bin/magento setup:di:compile`.
+The compiler stops with exit code 1, before it changes any output, when one of these packages is installed, enabled or disabled, or when `app/etc/config.php` enables one of these modules. A disabled module counts because Magento 2.4.8 still reads its configuration, so Magento's output would differ from this compiler's. Remove the package with composer, or use `bin/magento setup:di:compile` for that store.
 
 | Module | Package | Reason |
 | --- | --- | --- |

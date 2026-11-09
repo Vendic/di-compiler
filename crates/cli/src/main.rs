@@ -569,7 +569,21 @@ fn main() {
 
     // Before anything writes to or empties the output, so the store keeps its working output.
     let enabled_modules = load_module_order_from_config_php(&magento_root, &args.fallback_php);
-    if let Some(message) = incompatible_modules::enabled_incompatible_modules(&enabled_modules) {
+    let mut all_module_paths = read_module_paths(&magento_root);
+    all_module_paths.extend(composer_registered_module_roots(&magento_root));
+    let mut all_module_paths: Vec<PathBuf> = all_module_paths
+        .iter()
+        .flat_map(|path| registered_component_roots(path))
+        .collect();
+    all_module_paths.sort();
+    all_module_paths.dedup();
+    let installed_modules: FxHashSet<String> = all_module_paths
+        .iter()
+        .filter_map(|path| read_module_name_from_module_xml(path))
+        .collect();
+    if let Some(message) =
+        incompatible_modules::incompatible_modules(&installed_modules, &enabled_modules)
+    {
         eprintln!("error: {message}");
         std::process::exit(1);
     }
@@ -615,14 +629,6 @@ fn main() {
     // Phase 1 + 2: Walk PHP files + extract ClassInfo (parallel)
     // -----------------------------------------------------------------------
     let phase_1_2_started = Instant::now();
-    let mut all_module_paths = read_module_paths(&magento_root);
-    all_module_paths.extend(composer_registered_module_roots(&magento_root));
-    let mut all_module_paths: Vec<PathBuf> = all_module_paths
-        .iter()
-        .flat_map(|path| registered_component_roots(path))
-        .collect();
-    all_module_paths.sort();
-    all_module_paths.dedup();
     let (module_paths, mut disabled_module_paths) =
         split_disabled_modules(all_module_paths, &enabled_modules);
     let compiles_disabled_modules = compile_scope::compiles_disabled_modules(&magento_root)
