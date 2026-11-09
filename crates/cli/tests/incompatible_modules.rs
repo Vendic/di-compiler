@@ -1,5 +1,7 @@
-//! A module on the incompatibility list stops the compile when `app/etc/config.php` enables it.
-//! This is a deliberate difference from Magento, whose own compile runs fine with such a module.
+//! A module on the incompatibility list stops the compile when its package is installed, enabled
+//! or disabled, or when `app/etc/config.php` enables it. Magento 2.4.8 reads the configuration of a
+//! disabled module too, so a disabled module still changes Magento's output. This is a deliberate
+//! difference from Magento, whose own compile runs fine with such a module.
 //! The stop comes first, so the output of an earlier compile stays as it was.
 
 use std::collections::BTreeMap;
@@ -15,8 +17,13 @@ fn write(root: &Path, relative: &str, content: &str) {
     fs::write(path, content).unwrap();
 }
 
-/// A store with the module on disk. `config_php` decides whether it counts as used.
+/// A store with the module on disk.
 fn store(config_php: &str) -> Option<tempfile::TempDir> {
+    store_with(config_php, true)
+}
+
+/// A store with the module on disk when `installed`, or without its package.
+fn store_with(config_php: &str, installed: bool) -> Option<tempfile::TempDir> {
     if Command::new("php").arg("-v").output().is_err() {
         eprintln!("skipped: these tests need php on the PATH");
         return None;
@@ -24,7 +31,11 @@ fn store(config_php: &str) -> Option<tempfile::TempDir> {
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
     write(root, "app/etc/config.php", config_php);
-    for (folder, module) in [("Acme/On", "Acme_On"), ("Creatuity/Interception", MODULE)] {
+    let mut modules = vec![("Acme/On", "Acme_On")];
+    if installed {
+        modules.push(("Creatuity/Interception", MODULE));
+    }
+    for (folder, module) in modules {
         write(
             root,
             &format!("app/code/{folder}/registration.php"),
@@ -87,10 +98,17 @@ fn assert_stopped(output: &Output) {
         MODULE,
         "creatuity/magento2-interceptors",
         "Interceptor generator",
+        "Remove the package with composer",
         "bin/magento setup:di:compile",
     ] {
         assert!(stderr.contains(expected), "no {expected} in: {stderr}");
     }
+}
+
+fn assert_stopped_saying(output: &Output, state: &str) {
+    assert_stopped(output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(state), "no {state} in: {stderr}");
 }
 
 #[test]
@@ -144,8 +162,56 @@ fn enabled_module_stops_when_php_cannot_read_the_config() {
 }
 
 #[test]
-fn disabled_module_does_not_stop_the_compile() {
+fn enabled_module_says_it_is_installed_and_enabled() {
+    let Some(tmp) = store(&enabled()) else {
+        return;
+    };
+    assert_stopped_saying(&compile(tmp.path(), &[]), "is installed and enabled");
+}
+
+#[test]
+fn installed_module_set_to_0_stops_and_writes_nothing() {
     let Some(tmp) = store(&config(&format!("        '{MODULE}' => 0,\n"))) else {
+        return;
+    };
+    assert_stopped_saying(&compile(tmp.path(), &[]), "is installed but disabled");
+    assert!(!tmp.path().join("generated").exists());
+}
+
+#[test]
+fn installed_module_missing_from_the_config_stops() {
+    let Some(tmp) = store(&config("")) else {
+        return;
+    };
+    assert_stopped_saying(&compile(tmp.path(), &[]), "is installed but disabled");
+}
+
+#[test]
+fn installed_module_set_to_0_stops_when_php_cannot_read_the_config() {
+    let Some(tmp) = store(&config(&format!("        '{MODULE}' => 0,\n"))) else {
+        return;
+    };
+    assert_stopped_saying(
+        &compile(tmp.path(), &["--fallback-php", "/nonexistent/php"]),
+        "is installed but disabled",
+    );
+}
+
+#[test]
+fn enabled_module_without_its_package_stops() {
+    let Some(tmp) = store_with(&enabled(), false) else {
+        return;
+    };
+    assert_stopped_saying(
+        &compile(tmp.path(), &[]),
+        "is enabled in app/etc/config.php",
+    );
+}
+
+/// `composer remove` leaves the module in `app/etc/config.php`. Magento has nothing to read then.
+#[test]
+fn removed_package_set_to_0_does_not_stop_the_compile() {
+    let Some(tmp) = store_with(&config(&format!("        '{MODULE}' => 0,\n")), false) else {
         return;
     };
     let output = compile(tmp.path(), &[]);
@@ -156,8 +222,8 @@ fn disabled_module_does_not_stop_the_compile() {
 }
 
 #[test]
-fn module_missing_from_the_config_does_not_stop_the_compile() {
-    let Some(tmp) = store(&config("")) else {
+fn store_without_the_package_compiles() {
+    let Some(tmp) = store_with(&config(""), false) else {
         return;
     };
     let output = compile(tmp.path(), &[]);
