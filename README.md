@@ -89,7 +89,7 @@ sha256sum --check --ignore-missing checksums.txt
 chmod +x fast-di-compile-linux-amd64
 ```
 
-The Linux binaries are built on Debian bookworm and need glibc. A release is made with `scripts/release.sh <version>` on a Mac with Apple silicon and Docker. The script header lists what it checks.
+The Linux binaries are built on Debian bookworm and need glibc 2.34 or newer (Ubuntu 22.04, Debian 12 and later). A release is made with `scripts/release.sh <version>` on a Mac with Apple silicon and Docker. The script header lists what it checks.
 
 ### 2. Compile your Magento project
 
