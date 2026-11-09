@@ -34,6 +34,7 @@ trap cleanup EXIT
 [ "$(uname -s) $(uname -m)" = "Darwin arm64" ] || fail "run this on a Mac with Apple silicon"
 command -v docker > /dev/null && docker info > /dev/null 2>&1 || fail "Docker is not running"
 gh auth status > /dev/null 2>&1 || fail "gh is not logged in"
+[ -z "${NOTES_FILE:-}" ] || [ -f "$NOTES_FILE" ] || fail "NOTES_FILE $NOTES_FILE does not exist"
 cd "$ROOT"
 
 step "Checking the checkout"
