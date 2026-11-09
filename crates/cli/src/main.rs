@@ -31,6 +31,7 @@ mod compile_scope;
 mod di_xml_checks;
 mod file_level_checks;
 mod incompatible_modules;
+mod requested_regeneration;
 use class_checks::{ClassChecks, ScannedFile};
 use di_xml_checks::DiXmlCheck;
 use file_level_checks::run_file_level_checks;
@@ -603,6 +604,11 @@ fn main() {
             generated_root.display()
         );
         std::process::exit(1);
+    }
+
+    // Magento's boot before setup:di:compile, before PHP loads anything from generated/.
+    if !args.dry_run && requested_regeneration::clean(&magento_root) {
+        log::info!("var/.regenerate was set: removed it with generated/code, generated/metadata and var/cache, as Magento's boot does");
     }
 
     stop_when_php_cannot_start(&args.fallback_php, &magento_root);
