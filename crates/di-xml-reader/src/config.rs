@@ -420,6 +420,10 @@ pub fn registered_component_roots(folder: &std::path::Path) -> Vec<std::path::Pa
         for (at, _) in registration.match_indices("__DIR__") {
             let rest = registration[at + "__DIR__".len()..].trim_start();
             let Some(rest) = rest.strip_prefix('.') else {
+                // A bare `__DIR__` registers the folder itself, next to any `__DIR__ . '/...'` path.
+                if !roots.iter().any(|root| root == folder) {
+                    roots.push(folder.to_path_buf());
+                }
                 continue;
             };
             let rest = rest.trim_start();
@@ -637,6 +641,33 @@ mod tests {
 
         let frontend = super::find_di_xml_files_for_area(root, "frontend", &empty_order);
         assert!(frontend.contains(&module_root.join("etc/frontend/di.xml")));
+    }
+
+    #[test]
+    fn test_find_di_xml_files_includes_module_registered_with_bare_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let module_root = root.join("vendor/acme/pkg/src");
+        fs::create_dir_all(module_root.join("etc")).unwrap();
+        fs::create_dir_all(root.join("vendor/acme/pkg/dist")).unwrap();
+        fs::write(
+            module_root.join("registration.php"),
+            "<?php\nComponentRegistrar::register(ComponentRegistrar::MODULE, 'Acme_Pkg', __DIR__);\n\
+             ComponentRegistrar::register(ComponentRegistrar::LIBRARY, 'Acme_Pkg', __DIR__ . '/../dist');\n",
+        )
+        .unwrap();
+        fs::write(
+            module_root.join("etc/di.xml"),
+            r#"<?xml version="1.0"?><config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"></config>"#,
+        )
+        .unwrap();
+
+        let roots = super::registered_component_roots(&module_root);
+        assert!(roots.contains(&module_root));
+        assert!(roots.contains(&module_root.join("../dist")));
+
+        let global = super::find_di_xml_files(root, &FxHashMap::default());
+        assert!(global.contains(&module_root.join("etc/di.xml")));
     }
 
     #[test]
