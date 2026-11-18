@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Builds fast-di-compile for macOS and Linux (arm64 and amd64) on this Mac and publishes a
-# GitHub release on Vendic/di-compiler with the four binaries and checksums.txt.
+# GitHub release on Vendic/di-compiler with the four binaries and checksums.txt. It then sends
+# a tool-released event to Vendic/infrastructure, which rebuilds the runner images that carry
+# fast-di-compile with the new release.
 # Runs locally on purpose: the release does not use GitHub Actions.
 #
 # Usage: scripts/release.sh <version>            for example: scripts/release.sh 0.1.0
@@ -8,13 +10,14 @@
 #   DRY_RUN=1             build and check everything, but do not push the tag or publish
 #
 # Needs: a Mac on Apple silicon, rustup, Docker (OrbStack or Docker Desktop) for the Linux
-# builds, and gh logged in with write access to Vendic/di-compiler.
+# builds, and gh logged in with write access to Vendic/di-compiler and Vendic/infrastructure.
 #
 # Before you run it: set [workspace.package] version in Cargo.toml to <version> and merge
 # that to main. The script releases the commit that origin/main points to, nothing else.
 set -euo pipefail
 
 REPO=Vendic/di-compiler
+INFRA_REPO=Vendic/infrastructure
 BIN=fast-di-compile
 VERSION=${1:-}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -34,6 +37,9 @@ trap cleanup EXIT
 [ "$(uname -s) $(uname -m)" = "Darwin arm64" ] || fail "run this on a Mac with Apple silicon"
 command -v docker > /dev/null && docker info > /dev/null 2>&1 || fail "Docker is not running"
 gh auth status > /dev/null 2>&1 || fail "gh is not logged in"
+# Checked before anything is tagged, so a release never goes out without the image rebuild.
+[ "$(gh api repos/$INFRA_REPO --jq .permissions.push 2> /dev/null)" = true ] \
+    || fail "gh has no write access to $INFRA_REPO, which the runner image rebuild needs"
 [ -z "${NOTES_FILE:-}" ] || [ -f "$NOTES_FILE" ] || fail "NOTES_FILE $NOTES_FILE does not exist"
 cd "$ROOT"
 
@@ -128,3 +134,11 @@ gh release download "$VERSION" -R "$REPO" -D "$verify"
 cmp "$verify/checksums.txt" "$DIST/checksums.txt"
 rm -rf "$verify"
 echo; echo "Published: https://github.com/$REPO/releases/tag/$VERSION"
+
+step "Starting the runner image build on $INFRA_REPO"
+# build-ami.yml bakes the latest release into the MariaDB runner images.
+gh api "repos/$INFRA_REPO/dispatches" \
+    -f event_type=tool-released \
+    -f "client_payload[tool]=$BIN" \
+    -f "client_payload[version]=$VERSION"
+echo "Sent tool-released: https://github.com/$INFRA_REPO/actions/workflows/build-ami.yml"
